@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Generated data files
+*.csv
+*.jsonl
+seed_*.sql
+reset.sql
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

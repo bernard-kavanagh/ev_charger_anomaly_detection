@@ -1,0 +1,28 @@
+# TiCDC Changefeed Configuration
+# ================================
+# Captures changes from the context plane tables and
+# charger_windows to trigger the embedding service.
+
+[filter]
+# Only capture changes from these tables
+rules = [
+    'ev_charger.charger_windows',
+    'ev_charger.outage_catalog',
+    'ev_charger.agent_reasoning',
+    'ev_charger.fleet_memory'
+]
+
+[sink]
+# Use canal-json protocol for Kafka (easy to parse in Python)
+protocol = "canal-json"
+# Dispatch each table to its own Kafka topic
+dispatchers = [
+    { matcher = ['ev_charger.charger_windows'], topic = 'ticdc-charger-windows', partition = 'default' },
+    { matcher = ['ev_charger.outage_catalog'], topic = 'ticdc-outage-catalog', partition = 'default' },
+    { matcher = ['ev_charger.agent_reasoning'], topic = 'ticdc-agent-reasoning', partition = 'default' },
+    { matcher = ['ev_charger.fleet_memory'], topic = 'ticdc-fleet-memory', partition = 'default' },
+]
+
+[scheduler]
+# Use table-level dispatching for ordered processing
+region-per-table = true

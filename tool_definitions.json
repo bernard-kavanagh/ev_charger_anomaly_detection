@@ -1,0 +1,279 @@
+{
+  "tools": [
+    {
+      "name": "search_similar_outages",
+      "description": "Find historical outages whose signatures are most similar to a given charger's current anomaly window. Uses TiDB vector search (HNSW cosine distance) to match the current window's embedding against the outage catalog. Returns the top-k matches with root cause, resolution, and similarity score. Use this when a charger shows anomalous behaviour and you need to identify what historical failure pattern it resembles.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "window_id": {
+            "type": "integer",
+            "description": "The charger_windows.id of the anomaly window to match against."
+          },
+          "limit": {
+            "type": "integer",
+            "default": 5,
+            "description": "Maximum number of similar outages to return."
+          },
+          "severity_filter": {
+            "type": "string",
+            "enum": ["degraded", "offline", "safety", "any"],
+            "default": "any",
+            "description": "Optional filter to restrict results to a specific severity level."
+          },
+          "category_filter": {
+            "type": "string",
+            "enum": ["electrical", "mechanical", "firmware", "network", "thermal", "environmental", "unknown", "any"],
+            "default": "any",
+            "description": "Optional filter to restrict results to a specific failure category."
+          }
+        },
+        "required": ["window_id"]
+      }
+    },
+
+    {
+      "name": "search_prior_diagnoses",
+      "description": "Find prior investigation outcomes that are semantically similar to a given observation. Searches confirmed, dismissed, and escalated diagnoses using vector similarity. Use this at the start of an investigation to avoid re-deriving conclusions already reached on similar chargers or symptoms. Only rows with populated embeddings are searched.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "observation_text": {
+            "type": "string",
+            "description": "The current observation text to match against prior diagnosis observations and hypotheses."
+          },
+          "charger_id": {
+            "type": "string",
+            "description": "Optional: restrict to reasoning about a specific charger."
+          },
+          "resolution_filter": {
+            "type": "string",
+            "enum": ["confirmed", "dismissed", "escalated", "promoted", "any"],
+            "default": "any",
+            "description": "Filter by resolution status. Use 'confirmed' to find validated diagnoses."
+          },
+          "limit": {
+            "type": "integer",
+            "default": 5
+          }
+        },
+        "required": ["observation_text"]
+      }
+    },
+
+    {
+      "name": "write_reasoning_checkpoint",
+      "description": "Record an investigation outcome — a confirmed diagnosis, dismissal, escalation, or promoted pattern. Only call this when the investigation has reached a conclusion. Do NOT write open or speculative checkpoints — intermediate reasoning is ephemeral and lives only in the session's investigation_summary. Always call update_session_state to checkpoint reasoning in progress.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Current session identifier."
+          },
+          "charger_id": {
+            "type": "string",
+            "description": "The charger being investigated."
+          },
+          "site_id": {
+            "type": "string",
+            "description": "The site the charger belongs to."
+          },
+          "observation": {
+            "type": "string",
+            "description": "What the agent observed in the data. Be specific: include metric names, values, and time ranges."
+          },
+          "hypothesis": {
+            "type": "string",
+            "description": "What the agent thinks is happening and why. Reference outage catalog pattern IDs if applicable."
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "References to supporting data: charger_windows IDs, outage_catalog pattern_ids, or other reasoning IDs. Format: 'table:id' e.g. ['charger_windows:48291', 'outage_catalog:P-0047']."
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Confidence score from 0.0 (pure guess) to 1.0 (certain)."
+          },
+          "resolution": {
+            "type": "string",
+            "enum": ["confirmed", "dismissed", "escalated"],
+            "default": "confirmed",
+            "description": "Outcome of this investigation."
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Freeform tags for categorisation. E.g. ['contactor', 'coastal', 'firmware-3.1.x']."
+          }
+        },
+        "required": ["session_id", "charger_id", "observation"]
+      }
+    },
+
+    {
+      "name": "recall_fleet_memory",
+      "description": "Retrieve relevant fleet-wide knowledge that may apply to the current investigation. Searches the fleet_memory table using both scope filtering and vector similarity. Returns patterns, hardware notes, site context, and operational rules the agent has learned from past investigations across the entire fleet.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query_text": {
+            "type": "string",
+            "description": "Natural language description of what knowledge you're looking for."
+          },
+          "scope": {
+            "type": "string",
+            "description": "Scope filter. E.g. 'global', 'site:SITE-DUB-07', 'model:ABB-Terra-54'. Use 'any' for no scope filter.",
+            "default": "any"
+          },
+          "category_filter": {
+            "type": "string",
+            "enum": ["pattern", "preference", "hardware_note", "site_context", "firmware_bug", "seasonal", "operational_rule", "any"],
+            "default": "any"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 5
+          }
+        },
+        "required": ["query_text"]
+      }
+    },
+
+    {
+      "name": "write_fleet_memory",
+      "description": "Record a new piece of fleet-wide knowledge that the agent has learned. Use this when an investigation reveals a pattern that would be useful for future investigations across different chargers or sites. Only promote confirmed insights — not speculative hypotheses.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": ["pattern", "preference", "hardware_note", "site_context", "firmware_bug", "seasonal", "operational_rule"]
+          },
+          "scope": {
+            "type": "string",
+            "description": "Scope of applicability. E.g. 'global', 'site:SITE-DUB-07', 'model:ABB-Terra-54'."
+          },
+          "content": {
+            "type": "string",
+            "description": "The knowledge to remember. Be precise and actionable."
+          },
+          "source_refs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Which reasoning chains led to this insight. Format: 'agent_reasoning:id'."
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": ["category", "scope", "content"]
+      }
+    },
+
+    {
+      "name": "get_charger_context",
+      "description": "Retrieve a pre-assembled context snapshot for a charger or site. These snapshots are cached summaries that include the charger's profile, recent anomalies, maintenance history, and performance baselines — everything the agent needs to understand a charger's situation without querying raw telemetry. If the snapshot is stale or missing, the system will regenerate it.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "description": "Charger ID (e.g. 'CP-IE-DUB-04821') or site ID (e.g. 'SITE-DUB-CENTRAL-07')."
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": ["charger", "site", "fleet_summary"],
+            "default": "charger"
+          },
+          "snapshot_types": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["profile", "recent_anomalies", "maintenance_history", "performance_baseline", "active_investigations"]
+            },
+            "description": "Which snapshot types to retrieve. Omit to get all available.",
+            "default": ["profile", "recent_anomalies"]
+          }
+        },
+        "required": ["entity_id"]
+      }
+    },
+
+    {
+      "name": "get_recent_windows",
+      "description": "Retrieve recent Flink-produced window aggregates for a charger. Returns the windowed metrics (avg power, voltage stddev, temp, error counts, anomaly scores) for the most recent N windows. Use this when you need to see a charger's recent behaviour trend before deciding whether to investigate further.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "charger_id": {
+            "type": "string"
+          },
+          "hours_back": {
+            "type": "integer",
+            "default": 6,
+            "description": "How many hours of windows to retrieve."
+          },
+          "anomaly_only": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, only return windows with anomaly_score > 0."
+          }
+        },
+        "required": ["charger_id"]
+      }
+    },
+
+    {
+      "name": "get_session_state",
+      "description": "Retrieve or create the session state for the current investigation. Returns the session's focus chargers, site, investigation summary, and token budget. Call this at the start of every agent invocation to resume where you left off.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": ["session_id"]
+      }
+    },
+
+    {
+      "name": "update_session_state",
+      "description": "Update the current session's state — focus chargers, investigation summary, tokens used. Call this after each major reasoning step to checkpoint the session.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "focus_chargers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Charger IDs currently under investigation."
+          },
+          "focus_site": {
+            "type": "string"
+          },
+          "investigation_summary": {
+            "type": "string",
+            "description": "Current state of the investigation in natural language. Keep this under 200 tokens — write a compressed summary of what has been observed, what hypotheses have been formed, and what has been ruled out. Do not write a log. This is the agent's only persistent working memory during an active investigation and will be loaded at the start of the next invocation."
+          },
+          "tokens_used": {
+            "type": "integer",
+            "description": "Approximate tokens consumed by context so far."
+          }
+        },
+        "required": ["session_id"]
+      }
+    }
+  ]
+}
