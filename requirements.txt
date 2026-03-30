@@ -1,0 +1,17 @@
+# Core — required for all components
+pymysql>=1.1.0
+python-dotenv>=1.0.0
+
+# Agent — required for running investigations
+anthropic>=0.40.0
+tiktoken>=0.8.0
+sentence-transformers>=3.0.0
+
+# Embedding service
+langchain-community>=0.3.0
+
+# Optional: production streaming (uncomment if using Kafka/TiCDC)
+# kafka-python>=2.0.0
+
+# Optional: Flink windowing job
+# pyflink>=1.18.0

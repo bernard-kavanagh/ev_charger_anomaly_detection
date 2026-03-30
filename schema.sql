@@ -227,3 +227,57 @@ CREATE TABLE context_snapshots (
   INDEX idx_expires         (expires_at),
   UNIQUE INDEX idx_unique_snap (entity_id, snapshot_type)
 );
+
+-- ============================================================================
+-- PRODUCTION TTL POLICIES (Data Retention)
+-- ============================================================================
+-- At 20,000 chargers, the database accumulates ~112M telemetry rows/day and
+-- ~5.76M window rows/day. These TTL policies cap steady-state storage at
+-- ~960M rows across all tables.
+--
+-- To enable: uncomment the ALTER TABLE statements below and execute against
+-- your TiDB cluster. TTL runs in the background without affecting online
+-- read/write workloads. Policies can be disabled per-table with
+-- TTL_ENABLE = 'OFF' or removed with ALTER TABLE ... REMOVE TTL.
+--
+-- NOTE: Do NOT enable during demos or testing — TTL will delete your
+-- simulated data after the retention period expires.
+-- ============================================================================
+
+-- charger_telemetry: 7-day retention (highest volume, ~112M rows/day)
+-- Raw telemetry only needed for short-term debugging; aggregated value
+-- preserved in charger_windows.
+-- ALTER TABLE charger_telemetry TTL = `ts` + INTERVAL 7 DAY TTL_JOB_INTERVAL = '1h';
+
+-- charger_windows: 30-day retention (~5.76M rows/day)
+-- Anomaly windows older than 30 days have been investigated; diagnostic
+-- value captured in agent_reasoning and fleet_memory.
+-- ALTER TABLE charger_windows TTL = `window_start` + INTERVAL 30 DAY TTL_JOB_INTERVAL = '6h';
+
+-- session_state: 24-hour retention (short-lived investigation sessions)
+-- ALTER TABLE session_state TTL = `last_active` + INTERVAL 1 DAY TTL_JOB_INTERVAL = '1h';
+
+-- context_snapshots: expires_at-based retention (cached prompt fragments)
+-- Snapshots are created with expires_at = NOW() + 30 minutes.
+-- TTL fires once expires_at is in the past.
+-- ALTER TABLE context_snapshots TTL = `expires_at` + INTERVAL 0 DAY TTL_JOB_INTERVAL = '30m';
+
+-- Tables with NO TTL (persist indefinitely):
+--   charger_registry   — static hardware metadata, slowly changing
+--   outage_catalog     — curated ground truth, never expires
+--   agent_reasoning    — investigation outcomes, long-term history
+--   fleet_memory       — learned knowledge, permanent memory
+--                        (inactive memories deprecated via cleanup_job after 90 days)
+
+-- Steady-state storage with TTL enabled:
+--   charger_telemetry:  ~784M rows (7 days)
+--   charger_windows:    ~173M rows (30 days)
+--   session_state:      < 500 rows
+--   context_snapshots:  < 5,000 rows
+--   Total:              ~960M rows (vs unbounded 2B+/month without TTL)
+
+-- To rollback:
+-- ALTER TABLE charger_telemetry REMOVE TTL;
+-- ALTER TABLE charger_windows REMOVE TTL;
+-- ALTER TABLE session_state REMOVE TTL;
+-- ALTER TABLE context_snapshots REMOVE TTL;

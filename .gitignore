@@ -1,5 +1,7 @@
 # Environment & secrets
 .env
+.env.*
+!.env.example
 *.pem
 
 # Python
@@ -18,9 +20,16 @@ venv/
 seed_*.sql
 reset.sql
 
+# HuggingFace model cache
+.cache/
+
 # macOS
 .DS_Store
+Thumbs.db
 
 # IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+*~

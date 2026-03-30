@@ -135,38 +135,175 @@ EMBED_FN = embed_huggingface
 # Text builders: convert row data into embeddable text
 # ---------------------------------------------------------------------------
 
+def _band_power(power_w, max_power_w, status) -> str:
+    power_w = float(power_w or 0)
+    max_power_w = float(max_power_w or 0)
+    status = str(status or "")
+    if power_w == 0:
+        if status in ("Faulted", "Unavailable"):
+            return "zero power delivery, charger protection-locked or offline"
+        return "idle, no active session"
+    if max_power_w > 0:
+        if power_w < max_power_w * 0.5:
+            return "reduced power output, possible thermal de-rating or cable degradation"
+        return "normal power delivery"
+    # Fallback absolute thresholds (DC charger)
+    if power_w < 5000:
+        return "reduced power output, possible thermal de-rating or cable degradation"
+    if power_w <= 20000:
+        return "normal power delivery"
+    return "normal power delivery"
+
+
+def _band_voltage(voltage_stddev) -> str:
+    v = float(voltage_stddev or 0)
+    if v <= 2.0:
+        return "stable voltage"
+    if v <= 5.0:
+        return "minor voltage fluctuation, possible switching transients"
+    if v <= 8.0:
+        return "moderate voltage instability"
+    return "high voltage variance, possible supply sag or phase imbalance"
+
+
+def _band_earth_leak(earth_leak) -> str:
+    e = float(earth_leak or 0)
+    if e <= 1.0:
+        return "normal earth leakage"
+    if e <= 3.0:
+        return "slightly elevated earth leakage"
+    if e <= 6.0:
+        return "elevated earth leakage approaching protection threshold"
+    return "high earth leakage, ground protection fault likely"
+
+
+def _band_temp(temp_c) -> str:
+    t = float(temp_c or 0)
+    if t <= 25:
+        return "normal operating temperature"
+    if t <= 45:
+        return "warm, within expected range under load"
+    if t <= 55:
+        return "elevated temperature, possible cooling issue"
+    if t <= 65:
+        return "high temperature, thermal de-rating likely"
+    return "critical temperature, thermal runaway risk"
+
+
+def _band_fan(fan_rpm, power_w) -> str:
+    rpm = float(fan_rpm or 0)
+    power_w = float(power_w or 0)
+    if rpm >= 1500:
+        return "fan operating normally"
+    if rpm >= 500:
+        return "fan at reduced speed"
+    if rpm > 0:
+        return "fan critically degraded, bearing failure likely"
+    if power_w > 0:
+        return "fan not running under load, failure or blockage"
+    return "fan idle, charger not under load"
+
+
+def _band_errors(error_count) -> str:
+    n = int(error_count or 0)
+    if n == 0:
+        return "no errors"
+    if n <= 2:
+        return "occasional errors"
+    if n <= 5:
+        return "frequent errors"
+    return "error storm, multiple fault codes firing"
+
+
+def _band_status(status_changes) -> str:
+    s = int(status_changes or 0)
+    if s <= 2:
+        return "stable status"
+    if s <= 5:
+        return "some status transitions"
+    if s <= 10:
+        return "frequent status changes"
+    return "status flapping, rapid state transitions"
+
+
+def _band_severity(anomaly_score) -> str:
+    score = float(anomaly_score or 0)
+    if score == 0:
+        return "no anomaly detected"
+    if score <= 0.15:
+        return "minor anomaly detected"
+    if score <= 0.4:
+        return "anomaly detected with elevated severity"
+    if score <= 0.7:
+        return "significant anomaly, investigation recommended"
+    return "critical anomaly, immediate investigation required"
+
+
 def build_window_text(row: dict) -> str:
-    """Convert a charger_windows row into text for embedding."""
+    """Convert a charger_windows row into semantically banded text for embedding."""
+    charger_id = row.get("charger_id", "unknown")
+    power_w = row.get("avg_power_w") or row.get("max_power_w") or 0
+    max_power_w = row.get("max_power_w", 0)
+    status = row.get("charger_status", "")
+    fan_rpm = row.get("avg_fan_rpm", 0)
+
     parts = [
-        f"Charger {row.get('charger_id', 'unknown')}",
-        f"window {row.get('window_start', '')} to {row.get('window_end', '')}",
-        f"avg_power={row.get('avg_power_w', 0)}W",
-        f"max_power={row.get('max_power_w', 0)}W",
-        f"voltage_range={row.get('min_voltage_v', 0)}-{row.get('max_voltage_v', 0)}V",
-        f"voltage_stddev={row.get('voltage_stddev', 0)}",
-        f"max_temp={row.get('max_temp_c', 0)}C",
-        f"avg_temp={row.get('avg_temp_c', 0)}C",
-        f"errors={row.get('error_count', 0)}",
-        f"status_changes={row.get('status_changes', 0)}",
-        f"fan_rpm={row.get('avg_fan_rpm', 0)}",
-        f"earth_leak={row.get('max_earth_leak', 0)}mA",
-        f"anomaly_score={row.get('anomaly_score', 0)}",
+        f"Charger {charger_id} five-minute window",
+        _band_power(power_w, max_power_w, status).capitalize(),
+        _band_earth_leak(row.get("max_earth_leak", 0)).capitalize(),
+        _band_voltage(row.get("voltage_stddev", 0)).capitalize(),
+        _band_temp(row.get("max_temp_c", 0)).capitalize(),
+        _band_fan(fan_rpm, power_w).capitalize(),
     ]
-    if row.get("anomaly_flags"):
-        parts.append(f"flags={row['anomaly_flags']}")
-    if row.get("distinct_errors"):
-        parts.append(f"error_codes={row['distinct_errors']}")
-    return ". ".join(parts)
+
+    # Error description — include named codes if present
+    error_band = _band_errors(row.get("error_count", 0))
+    distinct_errors = row.get("distinct_errors")
+    if distinct_errors:
+        if isinstance(distinct_errors, str):
+            try:
+                distinct_errors = json.loads(distinct_errors)
+            except (json.JSONDecodeError, ValueError):
+                distinct_errors = [distinct_errors]
+        if isinstance(distinct_errors, list) and distinct_errors:
+            error_band += " including " + ", ".join(distinct_errors)
+    parts.append(error_band.capitalize())
+
+    parts.append(_band_status(row.get("status_changes", 0)).capitalize())
+
+    # Anomaly flags
+    flags = row.get("anomaly_flags")
+    if flags:
+        if isinstance(flags, str):
+            try:
+                flags = json.loads(flags)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if isinstance(flags, list) and flags:
+            parts.append("Flagged for " + ", ".join(flags))
+        elif isinstance(flags, str) and flags:
+            parts.append(f"Flagged for {flags}")
+
+    parts.append(_band_severity(row.get("anomaly_score", 0)).capitalize())
+    return ". ".join(parts) + "."
 
 
 def build_outage_text(row: dict) -> str:
     """Convert an outage_catalog row into text for embedding."""
+    symptoms = row.get("symptoms", "")
+    if isinstance(symptoms, str):
+        try:
+            symptoms = json.loads(symptoms)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if isinstance(symptoms, list):
+        symptoms = ", ".join(str(s) for s in symptoms) + "."
     parts = [
         f"Pattern: {row.get('pattern_name', '')}",
         f"Category: {row.get('category', '')}",
         f"Severity: {row.get('severity', '')}",
         f"Root cause: {row.get('root_cause', '')}",
-        f"Symptoms: {row.get('symptoms', '')}",
+        f"Symptoms: {symptoms}",
         f"Resolution: {row.get('resolution', '')}",
     ]
     return ". ".join(parts)
@@ -354,6 +491,7 @@ def _embed_table_batch(db, table: str, cfg: dict, batch_size: int) -> int:
         cur.execute(
             f"SELECT * FROM {table} "
             f"WHERE {cfg['vec_column']} IS NULL "
+            f"ORDER BY {cfg['id_column']} ASC "
             f"LIMIT {batch_size}"
         )
         rows = cur.fetchall()
@@ -369,15 +507,69 @@ def _embed_table_batch(db, table: str, cfg: dict, batch_size: int) -> int:
                                   list(zip(row_ids, embeddings)))
 
 
-def poll_and_embed(interval: int = 30, once: bool = False, batch_size: int = 32):
+def _reembed_table(table: str, cfg: dict, batch_size: int) -> int:
+    """Re-embed all rows in a table using cursor-based pagination. Returns total written."""
+    text_builder = TEXT_BUILDERS.get(table)
+    if not text_builder:
+        return 0
+
+    id_col = cfg["id_column"]
+    last_id = 0
+    total = 0
+
+    while True:
+        db = get_db()
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {table} "
+                    f"WHERE {id_col} > %s "
+                    f"ORDER BY {id_col} ASC "
+                    f"LIMIT {batch_size}",
+                    (last_id,)
+                )
+                rows = cur.fetchall()
+        finally:
+            db.close()
+
+        if not rows:
+            break
+
+        texts = [text_builder(row) for row in rows]
+        row_ids = [row[id_col] for row in rows]
+        last_id = max(row_ids)
+
+        written = write_embeddings_batch(table, cfg["vec_column"], id_col,
+                                         list(zip(row_ids, EMBED_FN(texts))))
+        total += written
+        log.info(f"{table}: +{written} this batch, {total} so far (cursor id>{last_id})")
+
+    return total
+
+
+def poll_and_embed(interval: int = 30, once: bool = False, batch_size: int = 32,
+                   reembed: bool = False):
     """
     Fallback mode: poll TiDB directly for rows with NULL vector columns.
     Use this when TiCDC/Kafka is not available (e.g. dev/test).
 
-    once=True: loop over all tables repeatedly until a full pass finds zero
-               NULL-vector rows across every table, then exit with a summary.
+    once=True: process all tables once and exit with a summary.
     once=False: loop forever, sleeping `interval` seconds between sweeps.
+    reembed=True: regenerate ALL rows using cursor-based pagination (one-time
+                  migration after text-builder format changes).
     """
+    if reembed:
+        log.info(f"Re-embed mode: paginating through all rows (batch_size={batch_size})")
+        totals = {}
+        for table, cfg in _POLL_TABLES:
+            log.info(f"Starting re-embed for {table}...")
+            totals[table] = _reembed_table(table, cfg, batch_size)
+            log.info(f"{table}: complete ({totals[table]} rows embedded)")
+        log.info("Re-embed complete. Summary:")
+        for table, count in totals.items():
+            log.info(f"  {table}: {count} rows embedded")
+        return
+
     if once:
         log.info(f"One-shot backfill mode (batch_size={batch_size})")
         totals = {table: 0 for table, _ in _POLL_TABLES}
@@ -439,12 +631,19 @@ if __name__ == "__main__":
                              f"(default: EMBEDDING_BATCH_SIZE env var or {EMBEDDING_BATCH_SIZE})")
     parser.add_argument("--interval", type=int, default=30,
                         help="Seconds between sweeps in continuous --poll mode (default: 30)")
+    parser.add_argument("--reembed", action="store_true",
+                        help="Regenerate embeddings for ALL rows, not just NULL-vector rows. "
+                             "Use after changing text builders to migrate existing embeddings. "
+                             "Requires --poll.")
     args = parser.parse_args()
+
+    if args.reembed and not args.poll:
+        parser.error("--reembed requires --poll")
 
     effective_batch_size = args.batch_size if args.batch_size is not None else EMBEDDING_BATCH_SIZE
 
     if args.poll:
         poll_and_embed(interval=args.interval, once=args.once,
-                       batch_size=effective_batch_size)
+                       batch_size=effective_batch_size, reembed=args.reembed)
     else:
         consume_and_embed()
