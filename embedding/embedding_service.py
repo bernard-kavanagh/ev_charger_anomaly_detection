@@ -132,204 +132,24 @@ EMBED_FN = embed_huggingface
 
 
 # ---------------------------------------------------------------------------
-# Text builders: convert row data into embeddable text
+# Text builders: imported from shared text_bander module
 # ---------------------------------------------------------------------------
+# IMPORTANT: text_bander.py is the single source of truth for all text
+# conversion. Both this embedding service and tool_handlers.py import from
+# the same module — preventing banding vocabulary drift between the embedding
+# pipeline and the agent's context assembly.
 
-def _band_power(power_w, max_power_w, status) -> str:
-    power_w = float(power_w or 0)
-    max_power_w = float(max_power_w or 0)
-    status = str(status or "")
-    if power_w == 0:
-        if status in ("Faulted", "Unavailable"):
-            return "zero power delivery, charger protection-locked or offline"
-        return "idle, no active session"
-    if max_power_w > 0:
-        if power_w < max_power_w * 0.5:
-            return "reduced power output, possible thermal de-rating or cable degradation"
-        return "normal power delivery"
-    # Fallback absolute thresholds (DC charger)
-    if power_w < 5000:
-        return "reduced power output, possible thermal de-rating or cable degradation"
-    if power_w <= 20000:
-        return "normal power delivery"
-    return "normal power delivery"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-
-def _band_voltage(voltage_stddev) -> str:
-    v = float(voltage_stddev or 0)
-    if v <= 2.0:
-        return "stable voltage"
-    if v <= 5.0:
-        return "minor voltage fluctuation, possible switching transients"
-    if v <= 8.0:
-        return "moderate voltage instability"
-    return "high voltage variance, possible supply sag or phase imbalance"
-
-
-def _band_earth_leak(earth_leak) -> str:
-    e = float(earth_leak or 0)
-    if e <= 1.0:
-        return "normal earth leakage"
-    if e <= 3.0:
-        return "slightly elevated earth leakage"
-    if e <= 6.0:
-        return "elevated earth leakage approaching protection threshold"
-    return "high earth leakage, ground protection fault likely"
-
-
-def _band_temp(temp_c) -> str:
-    t = float(temp_c or 0)
-    if t <= 25:
-        return "normal operating temperature"
-    if t <= 45:
-        return "warm, within expected range under load"
-    if t <= 55:
-        return "elevated temperature, possible cooling issue"
-    if t <= 65:
-        return "high temperature, thermal de-rating likely"
-    return "critical temperature, thermal runaway risk"
-
-
-def _band_fan(fan_rpm, power_w) -> str:
-    rpm = float(fan_rpm or 0)
-    power_w = float(power_w or 0)
-    if rpm >= 1500:
-        return "fan operating normally"
-    if rpm >= 500:
-        return "fan at reduced speed"
-    if rpm > 0:
-        return "fan critically degraded, bearing failure likely"
-    if power_w > 0:
-        return "fan not running under load, failure or blockage"
-    return "fan idle, charger not under load"
-
-
-def _band_errors(error_count) -> str:
-    n = int(error_count or 0)
-    if n == 0:
-        return "no errors"
-    if n <= 2:
-        return "occasional errors"
-    if n <= 5:
-        return "frequent errors"
-    return "error storm, multiple fault codes firing"
-
-
-def _band_status(status_changes) -> str:
-    s = int(status_changes or 0)
-    if s <= 2:
-        return "stable status"
-    if s <= 5:
-        return "some status transitions"
-    if s <= 10:
-        return "frequent status changes"
-    return "status flapping, rapid state transitions"
-
-
-def _band_severity(anomaly_score) -> str:
-    score = float(anomaly_score or 0)
-    if score == 0:
-        return "no anomaly detected"
-    if score <= 0.15:
-        return "minor anomaly detected"
-    if score <= 0.4:
-        return "anomaly detected with elevated severity"
-    if score <= 0.7:
-        return "significant anomaly, investigation recommended"
-    return "critical anomaly, immediate investigation required"
-
-
-def build_window_text(row: dict) -> str:
-    """Convert a charger_windows row into semantically banded text for embedding."""
-    charger_id = row.get("charger_id", "unknown")
-    power_w = row.get("avg_power_w") or row.get("max_power_w") or 0
-    max_power_w = row.get("max_power_w", 0)
-    status = row.get("charger_status", "")
-    fan_rpm = row.get("avg_fan_rpm", 0)
-
-    parts = [
-        f"Charger {charger_id} five-minute window",
-        _band_power(power_w, max_power_w, status).capitalize(),
-        _band_earth_leak(row.get("max_earth_leak", 0)).capitalize(),
-        _band_voltage(row.get("voltage_stddev", 0)).capitalize(),
-        _band_temp(row.get("max_temp_c", 0)).capitalize(),
-        _band_fan(fan_rpm, power_w).capitalize(),
-    ]
-
-    # Error description — include named codes if present
-    error_band = _band_errors(row.get("error_count", 0))
-    distinct_errors = row.get("distinct_errors")
-    if distinct_errors:
-        if isinstance(distinct_errors, str):
-            try:
-                distinct_errors = json.loads(distinct_errors)
-            except (json.JSONDecodeError, ValueError):
-                distinct_errors = [distinct_errors]
-        if isinstance(distinct_errors, list) and distinct_errors:
-            error_band += " including " + ", ".join(distinct_errors)
-    parts.append(error_band.capitalize())
-
-    parts.append(_band_status(row.get("status_changes", 0)).capitalize())
-
-    # Anomaly flags
-    flags = row.get("anomaly_flags")
-    if flags:
-        if isinstance(flags, str):
-            try:
-                flags = json.loads(flags)
-            except (json.JSONDecodeError, ValueError):
-                pass
-        if isinstance(flags, list) and flags:
-            parts.append("Flagged for " + ", ".join(flags))
-        elif isinstance(flags, str) and flags:
-            parts.append(f"Flagged for {flags}")
-
-    parts.append(_band_severity(row.get("anomaly_score", 0)).capitalize())
-    return ". ".join(parts) + "."
-
-
-def build_outage_text(row: dict) -> str:
-    """Convert an outage_catalog row into text for embedding."""
-    symptoms = row.get("symptoms", "")
-    if isinstance(symptoms, str):
-        try:
-            symptoms = json.loads(symptoms)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    if isinstance(symptoms, list):
-        symptoms = ", ".join(str(s) for s in symptoms) + "."
-    parts = [
-        f"Pattern: {row.get('pattern_name', '')}",
-        f"Category: {row.get('category', '')}",
-        f"Severity: {row.get('severity', '')}",
-        f"Root cause: {row.get('root_cause', '')}",
-        f"Symptoms: {symptoms}",
-        f"Resolution: {row.get('resolution', '')}",
-    ]
-    return ". ".join(parts)
-
-
-def build_reasoning_text(row: dict) -> str:
-    """Convert an agent_reasoning row into text for embedding."""
-    text = row.get("observation", "")
-    if row.get("hypothesis"):
-        text += f" | Hypothesis: {row['hypothesis']}"
-    if row.get("tags"):
-        text += f" | Tags: {row['tags']}"
-    return text
-
-
-def build_memory_text(row: dict) -> str:
-    """Convert a fleet_memory row into text for embedding."""
-    return f"[{row.get('category', '')}] [{row.get('scope', '')}] {row.get('content', '')}"
-
-
-TEXT_BUILDERS = {
-    "charger_windows": build_window_text,
-    "outage_catalog": build_outage_text,
-    "agent_reasoning": build_reasoning_text,
-    "fleet_memory": build_memory_text,
-}
+from text_bander import (  # noqa: E402
+    TEXT_BUILDERS,
+    build_window_text,
+    build_outage_text,
+    build_reasoning_text,
+    build_memory_text,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,1 @@
+-- Merged into schema.sql (v2 columns and indexes are now inline)
