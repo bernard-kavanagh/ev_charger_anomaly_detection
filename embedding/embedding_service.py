@@ -56,6 +56,11 @@ from typing import Optional
 
 import pymysql
 from dotenv import load_dotenv
+
+# Use shared text banding module (single source of truth)
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from text_bander import TEXT_BUILDERS, build_window_text, build_outage_text, build_reasoning_text, build_memory_text
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 load_dotenv()

@@ -216,33 +216,34 @@ python3 -c "from tool_handlers import compaction_job; print(compaction_job())"
 ```
 ev-charger-platform/
 ├── .env                          # TiDB + Anthropic credentials (not committed)
-├── schema.sql                    # TiDB DDL — 8 tables + TTL policies
-├── schema_v2.sql                 # v2 migration — FULLTEXT, anomaly_breakdown, supersession
+├── schema.sql                    # TiDB DDL (8 tables, v2 inline: FULLTEXT, anomaly_breakdown, superseded_by)
+├── schema_v2.sql                 # Stub (merged into schema.sql)
 ├── reset.sql                     # Drop all tables (for clean reset)
 ├── requirements.txt              # Python dependencies
 ├── tool_definitions.json         # Claude tool schemas (9 tools)
-├── tool_handlers.py              # Tool handlers, context assembly, agent loop, lifecycle jobs
-├── text_bander.py                # Shared text banding — single source of truth for embeddings
-├── validation.py                 # Data quality checks for telemetry ingest
-├── observability.py              # Structured JSON logging for agent runs
-├── UPGRADE.md                    # v2 changelog and apply instructions
+├── tool_handlers.py              # Tool handlers, context assembly, lifecycle jobs (v2: hybrid search, circuit breaker, @_safe_handler)
+├── text_bander.py                # Shared semantic banding module (v2)
+├── validation.py                 # Data quality checks (v2)
+├── observability.py              # Structured JSON logging via AgentObserver (v2)
+├── UPGRADE.md                    # v2 changelog
+├── check-upgrade.md              # Claude CLI audit prompt
 ├── seed/
 │   ├── seed_charger_registry.py  # Generate 20,000 charger records
 │   ├── seed_outage_catalog.py    # 24 curated failure patterns
-│   └── stream_telemetry.py       # Telemetry simulator with --format direct mode
+│   └── stream_telemetry.py       # Telemetry simulator with --direct mode
 ├── embedding/
-│   └── embedding_service.py      # Embedding pipeline (poll/Kafka/reembed modes)
+│   └── embedding_service.py      # Embedding pipeline (poll/Kafka/reembed modes, imports text_bander)
 ├── agent/
 │   ├── __init__.py               # Package marker
 │   ├── run_agent.py              # Single-agent CLI
 │   └── dispatch.py               # Multi-agent concurrent dispatcher
-├── tests/
-│   ├── __init__.py
-│   └── test_tool_handlers.py     # 36 unit tests
 ├── flink/
 │   └── flink_windowing_job.py    # PyFlink job (optional, for production)
-└── config/
-    └── ticdc_config.toml         # TiCDC changefeed config (Essentials/Dedicated)
+├── config/
+│   └── ticdc_config.toml         # TiCDC changefeed config (Essentials/Dedicated)
+└── tests/
+    ├── __init__.py               # Test package marker
+    └── test_tool_handlers.py     # 36 unit tests (v2)
 ```
 
 ---
@@ -330,9 +331,31 @@ The `anomaly_breakdown` JSON column on `charger_windows` stores per-feature scor
 
 ---
 
+## v2 Upgrade (April 2026)
+
+The platform underwent a 25-point architecture audit. Result: 22 green, 3 orange, 0 red. 36 unit tests passing.
+
+**New capabilities:**
+- **Hybrid search:** Vector cosine + FULLTEXT keyword matching in a single SQL query
+- **Contradiction resolution:** `superseded_by` column auto-links stale conclusions to newer evidence
+- **Fleet memory compaction:** Weekly re-clustering merges drifted memories (cosine < 0.20)
+- **Confidence decay:** 5% monthly decay without reinforcement; auto-deprecated below 0.30
+- **Anomaly explainability:** Per-feature score breakdown in `anomaly_breakdown` JSON column
+- **Data validation:** Reject physically impossible telemetry before ingest
+- **Observability:** Structured JSON logging via `AgentObserver` class
+- **Circuit breaker:** `max_tool_rounds=15`, consecutive-same-tool detection
+- **Error handling:** `@_safe_handler` decorator on all 9 tool handlers
+- **Token safety margin:** 10% buffer (3,600 effective from 4,000 nominal)
+- **Shared text banding:** `text_bander.py` used by both embedding service and agent context assembly
+- **Single-query scoped recall:** 3 scope queries collapsed to 1 with post-ranking
+
+See `UPGRADE.md` for the full changelog.
+
+---
+
 ## Key Design Decisions
 
-- **Single cluster, unified platform.** TiDB's native `VECTOR` type with HNSW indexing handles OLTP, vector search, and agent memory in one transactional system. No frankenstack of bolt-on services — every additional system boundary adds sync lag, consistency gaps, and token debt from context that has to be re-assembled across sources.
+- **Single cluster, unified platform.** TiDB's native `VECTOR` type with HNSW indexing handles both OLTP reads/writes and vector similarity search. No frankenstack of bolt-on services — every additional system boundary adds sync lag, consistency gaps, and token debt.
 - **Polling mode is first-class for Serverless.** `--poll --once` is the intended embedding path when TiCDC changefeeds are unavailable.
 - **Outcomes only in agent_reasoning.** Intermediate reasoning is not persisted. Only conclusions are written. Table bounded at O(investigations) not O(reasoning steps).
 - **Semantic banding for embeddings.** `text_bander.py` converts raw metrics to natural language ("slightly elevated earth leakage", "error storm"). This is the single source of truth — both `embedding_service.py` and `stream_telemetry.py` import from the same module.
