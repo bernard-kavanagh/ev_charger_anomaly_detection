@@ -2,6 +2,8 @@
 
 Single-cluster TiDB Cloud architecture for streaming IoT telemetry from 20,000 OCPP chargers with self-improving AI diagnostic agents.
 
+This platform implements the **cognitive foundation** architecture — a three-tier memory structure (episodic, semantic, procedural) with five custodial duties, running on a unified data substrate. It solves the **Memory Wall**: the infrastructure problem caused by stateless models on fragmented stacks.
+
 **v2 (April 2026):** Hybrid search, contradiction resolution, fleet memory compaction, anomaly explainability, data validation, structured observability, and 36 unit tests. See [UPGRADE.md](UPGRADE.md) for the full changelog.
 
 ---
@@ -263,14 +265,16 @@ All state lives in a single TiDB Cloud cluster split across two logical planes:
 | `charger_windows` | 5-min aggregates with anomaly scores, breakdown, and 384-dim vector |
 | `outage_catalog` | 24 curated failure patterns with 384-dim vector + FULLTEXT index |
 
-**Context plane** — Agent memory
+**Context Plane** — Three-Tier Agent Memory
 
 | Table | Purpose |
 |---|---|
 | `session_state` | Active investigation state per session |
-| `agent_reasoning` | Outcome records with supersession tracking + FULLTEXT index |
-| `fleet_memory` | Promoted cross-fleet patterns, cosine-deduplicated + FULLTEXT index |
-| `context_snapshots` | Cached, token-counted prompt fragments |
+| `agent_reasoning` | **Episodic Memory**: Time-stamped investigation outcomes — confirmed, dismissed, escalated (with supersession tracking + FULLTEXT index) |
+| `fleet_memory` | **Semantic Memory**: Fleet-wide learned knowledge, scoped (global/site/model), cosine-deduplicated at < 0.15 (+ FULLTEXT index) |
+| `context_snapshots` | Cached, token-counted prompt fragments (operational infrastructure) |
+
+> **Procedural Memory** — investigation strategies are currently encoded implicitly in semantic memory and the agent's system prompt. Explicit procedural memory with its own retrieval path is planned for the cognitive foundation project.
 
 All vector columns: `VECTOR(384)`, HNSW cosine index.
 
@@ -288,7 +292,7 @@ All vector columns: `VECTOR(384)`, HNSW cosine index.
 | `get_session_state` | Read current session investigation state |
 | `update_session_state` | Write updated focus chargers and summary |
 
-### Context assembly and token budget
+### Context Assembly (Infrastructure-Level)
 
 `assemble_context()` in `tool_handlers.py` builds the agent's system prompt under a 4,000-token hard cap (3,600 effective after 10% safety margin), loading sources in priority order:
 
@@ -302,7 +306,9 @@ All vector columns: `VECTOR(384)`, HNSW cosine index.
 
 Total: ~580–1,380 tokens, leaving 2,200+ for reasoning and response.
 
-### Memory lifecycle
+Context assembly runs **before** the model is invoked — zero LLM calls, pure SQL. The model never decides what to remember. The platform decides for it. This eliminates the **Token Tax**: the quadratic cost of re-assembling context from scratch on every invocation.
+
+### Custodial Duties (Memory Lifecycle)
 
 1. **Write control:** Agent writes a reasoning checkpoint only when it reaches a conclusion (confirmed/dismissed/escalated). Intermediate reasoning stays ephemeral.
 2. **Deduplication:** `write_fleet_memory()` checks cosine distance < 0.15 before insert. Near-duplicates are merged, incrementing `supporting_evidence_count`.
@@ -310,6 +316,8 @@ Total: ~580–1,380 tokens, leaving 2,200+ for reasoning and response.
 4. **Confidence decay:** `cleanup_job()` applies `confidence *= 0.95` monthly for memories older than 30 days. Memories below 0.30 are auto-deprecated.
 5. **Compaction:** `compaction_job()` weekly re-clusters fleet memories, merging entries that have drifted within cosine distance 0.20.
 6. **Forgetting:** TTL policies cap storage at ~960M rows. 90-day zero-access deprecation. Expired context snapshots pruned automatically.
+
+The platform maintains memory through **five custodial duties**: write control (outcomes only), deduplication (cosine < 0.15), reconciliation (`superseded_by` chains), confidence decay (5% monthly, auto-deprecated below 0.30), and compaction (weekly re-clustering). These are SQL operations inside the cluster — not LLM calls, not external services.
 
 ### Hybrid search
 
@@ -355,7 +363,7 @@ See `UPGRADE.md` for the full changelog.
 
 ## Key Design Decisions
 
-- **Single cluster, unified platform.** TiDB's native `VECTOR` type with HNSW indexing handles both OLTP reads/writes and vector similarity search. No frankenstack of bolt-on services — every additional system boundary adds sync lag, consistency gaps, and token debt.
+- **Unified data substrate.** TiDB's native `VECTOR` type with HNSW indexing handles OLTP reads/writes and vector similarity search in one cluster. No frankenstack of bolt-on services — every additional system boundary adds sync lag, consistency gaps, and token debt.
 - **Polling mode is first-class for Serverless.** `--poll --once` is the intended embedding path when TiCDC changefeeds are unavailable.
 - **Outcomes only in agent_reasoning.** Intermediate reasoning is not persisted. Only conclusions are written. Table bounded at O(investigations) not O(reasoning steps).
 - **Semantic banding for embeddings.** `text_bander.py` converts raw metrics to natural language ("slightly elevated earth leakage", "error storm"). This is the single source of truth — both `embedding_service.py` and `stream_telemetry.py` import from the same module.
