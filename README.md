@@ -60,15 +60,21 @@ stream_telemetry.py --format direct ────────► TiDB: charger_te
 
 ## Prerequisites
 
-- Python 3.10+
-- TiDB Cloud cluster — Serverless for development, Essentials or Dedicated for production (TiCDC requires Essentials+)
-- Anthropic API key
+- **OS:** Linux, macOS, or Windows with WSL2. Plain Windows is not supported — the setup steps use bash (`set -a && source .env`).
+- **Python 3.10+** with `pip` (on some distros `pip` is a separate package, e.g. `python3-pip` on Fedora).
+- **MySQL client CLI** for applying the schema: `brew install mysql-client` (macOS), `apt install mysql-client` (Debian/Ubuntu), `dnf install mysql` (Fedora).
+- **TiDB Cloud cluster** — Starter for development, Essentials or Premium for production (TiCDC + Kafka sink require Essentials+).
+- **Anthropic API key.** Workshop attendees will be given a shared key on the day; otherwise BYO.
 
 ---
 
 ## Python Dependencies
 
+We strongly recommend a virtual environment so this project doesn't pollute your global Python install:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate    # on WSL: same; on Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -78,11 +84,10 @@ pip install -r requirements.txt
 | `python-dotenv` | `.env` loading (all components) |
 | `anthropic` | Claude API — agent loop |
 | `tiktoken` | Token counting for context budget |
-| `sentence-transformers` | HuggingFace embedding model |
-| `langchain-community` | `HuggingFaceEmbeddings` wrapper used by embedding service |
+| `sentence-transformers` | HuggingFace embedding model (used by both agent and embedding service) |
 | `pytest` | Unit test suite |
-| `kafka-python` | Kafka consumer — production TiCDC mode only |
-| `pyflink` | Flink windowing job — production only |
+| `kafka-python` | Kafka consumer — production TiCDC mode only (commented out by default) |
+| `pyflink` | Flink windowing job — production only (commented out by default) |
 
 ---
 
@@ -91,24 +96,27 @@ pip install -r requirements.txt
 ### 1. Clone and configure
 
 ```bash
-git clone <repo-url>
-cd ev-charger-platform
+git clone https://github.com/bernard-kavanagh/ev_charger_anomaly_detection.git
+cd ev_charger_anomaly_detection
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your TiDB Cloud and Anthropic credentials
 ```
+
+For `TIDB_SSL_CA`, point at your system CA bundle:
+- macOS / Fedora: `/etc/ssl/cert.pem`
+- Debian / Ubuntu: `/etc/ssl/certs/ca-certificates.crt`
+- Or download `isrgrootx1.pem` from [letsencrypt.org/certs/isrgrootx1.pem](https://letsencrypt.org/certs/isrgrootx1.pem)
 
 ### 2. Apply schema
 
 ```bash
 set -a && source .env && set +a
 
-# Base schema (8 tables)
+# All tables, indexes, and v2 features (FULLTEXT, anomaly_breakdown, supersession)
 mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u "$TIDB_USER" -p"$TIDB_PASSWORD" \
   --ssl-ca="$TIDB_SSL_CA" "$TIDB_DATABASE" < schema.sql
-
-# v2 migration (FULLTEXT indexes, anomaly_breakdown, contradiction tracking)
-mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u "$TIDB_USER" -p"$TIDB_PASSWORD" \
-  --ssl-ca="$TIDB_SSL_CA" "$TIDB_DATABASE" < schema_v2.sql
 ```
 
 ### 3. Seed reference data
@@ -219,8 +227,6 @@ python3 -c "from tool_handlers import compaction_job; print(compaction_job())"
 ev-charger-platform/
 ├── .env                          # TiDB + Anthropic credentials (not committed)
 ├── schema.sql                    # TiDB DDL (8 tables, v2 inline: FULLTEXT, anomaly_breakdown, superseded_by)
-├── schema_v2.sql                 # Stub (merged into schema.sql)
-├── reset.sql                     # Drop all tables (for clean reset)
 ├── requirements.txt              # Python dependencies
 ├── tool_definitions.json         # Claude tool schemas (9 tools)
 ├── tool_handlers.py              # Tool handlers, context assembly, lifecycle jobs (v2: hybrid search, circuit breaker, @_safe_handler)
@@ -364,7 +370,7 @@ See `UPGRADE.md` for the full changelog.
 ## Key Design Decisions
 
 - **Unified data substrate.** TiDB's native `VECTOR` type with HNSW indexing handles OLTP reads/writes and vector similarity search in one cluster. No frankenstack of bolt-on services — every additional system boundary adds sync lag, consistency gaps, and token debt.
-- **Polling mode is first-class for Serverless.** `--poll --once` is the intended embedding path when TiCDC changefeeds are unavailable.
+- **Polling mode is first-class for Starter.** `--poll --once` is the intended embedding path when TiCDC changefeeds are unavailable.
 - **Outcomes only in agent_reasoning.** Intermediate reasoning is not persisted. Only conclusions are written. Table bounded at O(investigations) not O(reasoning steps).
 - **Semantic banding for embeddings.** `text_bander.py` converts raw metrics to natural language ("slightly elevated earth leakage", "error storm"). This is the single source of truth — both `embedding_service.py` and `stream_telemetry.py` import from the same module.
 - **384-dim all-MiniLM-L6-v2.** Runs locally, no API key, no rate limits, no per-token cost.
@@ -374,7 +380,7 @@ See `UPGRADE.md` for the full changelog.
 
 ## TiDB Cloud Tier Guide
 
-| Feature | Serverless | Essentials | Dedicated |
+| Feature | Starter | Essentials | Premium |
 |---|---|---|---|
 | Vector search (`VECTOR`, HNSW) | Yes | Yes | Yes |
 | FULLTEXT indexes (hybrid search) | Yes | Yes | Yes |
