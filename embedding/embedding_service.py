@@ -61,7 +61,6 @@ from dotenv import load_dotenv
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from text_bander import TEXT_BUILDERS, build_window_text, build_outage_text, build_reasoning_text, build_memory_text
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
 load_dotenv()
 
@@ -89,15 +88,15 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "32"))
 EMBEDDING_WORKERS = int(os.environ.get("EMBEDDING_WORKERS", "4"))
 
-# Lazy-loaded HuggingFace model (same pattern as tidb-self-healing-db-agent)
-_hf_embeddings = None
+_embed_model = None
 
-def _get_hf_embeddings() -> HuggingFaceEmbeddings:
-    global _hf_embeddings
-    if _hf_embeddings is None:
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
         log.info(f"Loading embedding model ({EMBEDDING_MODEL})...")
-        _hf_embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    return _hf_embeddings
+        _embed_model = SentenceTransformer(EMBEDDING_MODEL)
+    return _embed_model
 
 # Topic → (table_name, text_builder_function, vector_column, id_column)
 TOPIC_CONFIG = {
@@ -130,7 +129,7 @@ TOPIC_CONFIG = {
 
 def embed_huggingface(texts: list[str]) -> list[list[float]]:
     """Generate embeddings using local HuggingFace sentence-transformers model."""
-    return _get_hf_embeddings().embed_documents(texts)
+    return _get_embed_model().encode(texts).tolist()
 
 
 EMBED_FN = embed_huggingface
