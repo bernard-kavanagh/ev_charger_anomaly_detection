@@ -33,3 +33,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+.claude/
+run.log
+.claude/
+run.log

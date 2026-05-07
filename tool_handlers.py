@@ -19,6 +19,7 @@ import json
 import os
 import time
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +27,7 @@ from typing import Optional
 
 import pymysql
 import tiktoken
+from dbutils.pooled_db import PooledDB
 
 from text_bander import TEXT_BUILDERS, build_window_text
 from observability import AgentObserver
@@ -37,18 +39,38 @@ log = logging.getLogger(__name__)
 # Database connection
 # ---------------------------------------------------------------------------
 
+_pool = None
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        ssl_ca = os.environ.get("TIDB_SSL_CA")
+        _pool = PooledDB(
+            creator=pymysql,
+            maxconnections=20,
+            mincached=2,
+            maxcached=5,
+            blocking=True,
+            host=os.environ["TIDB_HOST"],
+            port=int(os.environ.get("TIDB_PORT", 4000)),
+            user=os.environ["TIDB_USER"],
+            password=os.environ["TIDB_PASSWORD"],
+            database=os.environ["TIDB_DATABASE"],
+            ssl={"ca": ssl_ca} if ssl_ca else None,
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=True,
+        )
+    return _pool
+
+
+@contextmanager
 def get_db():
-    ssl_ca = os.environ.get("TIDB_SSL_CA")
-    return pymysql.connect(
-        host=os.environ["TIDB_HOST"],
-        port=int(os.environ.get("TIDB_PORT", 4000)),
-        user=os.environ["TIDB_USER"],
-        password=os.environ["TIDB_PASSWORD"],
-        database=os.environ["TIDB_DATABASE"],
-        ssl={"ca": ssl_ca} if ssl_ca else None,
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+    conn = _get_pool().connection()
+    try:
+        yield conn
+    finally:
+        conn.close()  # returns to pool, does not actually close
 
 
 # ---------------------------------------------------------------------------
@@ -243,36 +265,36 @@ def search_similar_outages(window_id: int, limit: int = 5,
                            category_filter: str = "any") -> str:
     """Find outage catalog entries similar to a given anomaly window.
     Uses hybrid search: vector cosine + FULLTEXT keyword boost."""
-    db = get_db()
-    with db.cursor() as cur:
-        cur.execute(
-            "SELECT signature_vec, charger_id, window_start, anomaly_score, "
-            "anomaly_breakdown "
-            "FROM charger_windows WHERE id = %s", (window_id,)
-        )
-        window = cur.fetchone()
-        if not window or not window["signature_vec"]:
-            return to_json({"error": f"Window {window_id} not found or has no embedding."})
+    with get_db() as db:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT signature_vec, charger_id, window_start, anomaly_score, "
+                "anomaly_breakdown "
+                "FROM charger_windows WHERE id = %s", (window_id,)
+            )
+            window = cur.fetchone()
+            if not window or not window["signature_vec"]:
+                return to_json({"error": f"Window {window_id} not found or has no embedding."})
 
-        where_clauses = []
-        params = []
-        if severity_filter != "any":
-            where_clauses.append("severity = %s")
-            params.append(severity_filter)
-        if category_filter != "any":
-            where_clauses.append("category = %s")
-            params.append(category_filter)
+            where_clauses = []
+            params = []
+            if severity_filter != "any":
+                where_clauses.append("severity = %s")
+                params.append(severity_filter)
+            if category_filter != "any":
+                where_clauses.append("category = %s")
+                params.append(category_filter)
 
-        # Build a text query from the window's anomaly description
-        query_text = build_window_text(window)
+            # Build a text query from the window's anomaly description
+            query_text = build_window_text(window)
 
-        results = _hybrid_search(
-            cur, "outage_catalog", "signature_vec",
-            ["pattern_name", "root_cause", "resolution"],
-            window["signature_vec"], query_text,
-            where_clauses, params, limit,
-            ft_index="ft_outage_text",
-        )
+            results = _hybrid_search(
+                cur, "outage_catalog", "signature_vec",
+                ["pattern_name", "root_cause", "resolution"],
+                window["signature_vec"], query_text,
+                where_clauses, params, limit,
+                ft_index="ft_outage_text",
+            )
 
     return to_json({
         "window": {
@@ -298,35 +320,35 @@ def search_prior_diagnoses(observation_text: str,
     """Find prior investigation outcomes similar to a given observation.
     Filters out superseded diagnoses."""
     vec = embed(observation_text)
-    db = get_db()
-    with db.cursor() as cur:
-        where_clauses = [
-            "ar.reasoning_vec IS NOT NULL",
-            "ar.superseded_by IS NULL",  # Exclude superseded diagnoses
-        ]
-        params = [str(vec)]
-        if charger_id:
-            where_clauses.append("ar.charger_id = %s")
-            params.append(charger_id)
-        if resolution_filter != "any":
-            where_clauses.append("ar.resolution = %s")
-            params.append(resolution_filter)
+    with get_db() as db:
+        with db.cursor() as cur:
+            where_clauses = [
+                "ar.reasoning_vec IS NOT NULL",
+                "ar.superseded_by IS NULL",  # Exclude superseded diagnoses
+            ]
+            params = [str(vec)]
+            if charger_id:
+                where_clauses.append("ar.charger_id = %s")
+                params.append(charger_id)
+            if resolution_filter != "any":
+                where_clauses.append("ar.resolution = %s")
+                params.append(resolution_filter)
 
-        where_sql = "WHERE " + " AND ".join(where_clauses)
+            where_sql = "WHERE " + " AND ".join(where_clauses)
 
-        sql = f"""
-            SELECT ar.id, ar.charger_id, ar.site_id, ar.session_id,
-                   ar.created_at, ar.observation, ar.hypothesis,
-                   ar.evidence_refs, ar.confidence, ar.resolution, ar.tags,
-                   VEC_COSINE_DISTANCE(ar.reasoning_vec, %s) AS distance
-            FROM agent_reasoning ar
-            {where_sql}
-            ORDER BY distance ASC
-            LIMIT %s
-        """
-        params.append(limit)
-        cur.execute(sql, params)
-        results = cur.fetchall()
+            sql = f"""
+                SELECT ar.id, ar.charger_id, ar.site_id, ar.session_id,
+                       ar.created_at, ar.observation, ar.hypothesis,
+                       ar.evidence_refs, ar.confidence, ar.resolution, ar.tags,
+                       VEC_COSINE_DISTANCE(ar.reasoning_vec, %s) AS distance
+                FROM agent_reasoning ar
+                {where_sql}
+                ORDER BY distance ASC
+                LIMIT %s
+            """
+            params.append(limit)
+            cur.execute(sql, params)
+            results = cur.fetchall()
 
     return to_json({
         "query": observation_text[:200],
@@ -350,36 +372,36 @@ def write_reasoning_checkpoint(session_id: str, charger_id: str,
     """Write a reasoning checkpoint to agent_reasoning.
     If this contradicts a prior diagnosis for the same charger, mark
     the prior one as superseded."""
-    db = get_db()
-    with db.cursor() as cur:
-        # Insert the new reasoning
-        cur.execute("""
-            INSERT INTO agent_reasoning
-                (charger_id, site_id, session_id, observation, hypothesis,
-                 evidence_refs, confidence, resolution, tags)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            charger_id, site_id, session_id, observation, hypothesis,
-            json.dumps(evidence_refs or []),
-            confidence, resolution,
-            json.dumps(tags or []),
-        ))
-        new_id = cur.lastrowid
-
-        # Check for contradictions: if this is a confirmed diagnosis for a
-        # charger that already has a different confirmed diagnosis, link them
-        superseded_count = 0
-        if resolution == "confirmed" and charger_id:
+    with get_db() as db:
+        with db.cursor() as cur:
+            # Insert the new reasoning
             cur.execute("""
-                UPDATE agent_reasoning
-                SET superseded_by = %s, superseded_at = NOW()
-                WHERE charger_id = %s
-                  AND resolution = 'confirmed'
-                  AND id != %s
-                  AND superseded_by IS NULL
-                  AND created_at > NOW() - INTERVAL 30 DAY
-            """, (new_id, charger_id, new_id))
-            superseded_count = cur.rowcount
+                INSERT INTO agent_reasoning
+                    (charger_id, site_id, session_id, observation, hypothesis,
+                     evidence_refs, confidence, resolution, tags)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                charger_id, site_id, session_id, observation, hypothesis,
+                json.dumps(evidence_refs or []),
+                confidence, resolution,
+                json.dumps(tags or []),
+            ))
+            new_id = cur.lastrowid
+
+            # Check for contradictions: if this is a confirmed diagnosis for a
+            # charger that already has a different confirmed diagnosis, link them
+            superseded_count = 0
+            if resolution == "confirmed" and charger_id:
+                cur.execute("""
+                    UPDATE agent_reasoning
+                    SET superseded_by = %s, superseded_at = NOW()
+                    WHERE charger_id = %s
+                      AND resolution = 'confirmed'
+                      AND id != %s
+                      AND superseded_by IS NULL
+                      AND created_at > NOW() - INTERVAL 30 DAY
+                """, (new_id, charger_id, new_id))
+                superseded_count = cur.rowcount
 
     return to_json({
         "status": "ok",
@@ -402,43 +424,43 @@ def recall_fleet_memory(query_text: str,
     instead of 3 sequential queries per scope level.
     """
     vec = embed(query_text)
-    db = get_db()
-    with db.cursor() as cur:
-        where_clauses = ["fm.status = 'active'", "fm.memory_vec IS NOT NULL"]
-        params = []
+    with get_db() as db:
+        with db.cursor() as cur:
+            where_clauses = ["fm.status = 'active'", "fm.memory_vec IS NOT NULL"]
+            params = []
 
-        if scope != "any":
-            # Single query: match the specific scope OR global, then rank
-            where_clauses.append("(fm.scope = %s OR fm.scope = 'global')")
-            params.append(scope)
-        if category_filter != "any":
-            where_clauses.append("fm.category = %s")
-            params.append(category_filter)
+            if scope != "any":
+                # Single query: match the specific scope OR global, then rank
+                where_clauses.append("(fm.scope = %s OR fm.scope = 'global')")
+                params.append(scope)
+            if category_filter != "any":
+                where_clauses.append("fm.category = %s")
+                params.append(category_filter)
 
-        # Hybrid search with FULLTEXT boost on content
-        results = _hybrid_search(
-            cur, "fleet_memory fm", "fm.memory_vec",
-            ["fm.content"], str(vec), query_text,
-            where_clauses, params, limit,
-            ft_index="ft_memory_content",
-        )
+            # Hybrid search with FULLTEXT boost on content
+            results = _hybrid_search(
+                cur, "fleet_memory fm", "fm.memory_vec",
+                ["fm.content"], str(vec), query_text,
+                where_clauses, params, limit,
+                ft_index="ft_memory_content",
+            )
 
-        # Post-rank: prefer specific scope over global at same distance
-        if scope != "any":
-            for r in results:
-                if r.get("scope") == scope:
-                    r["distance"] = float(r.get("distance", 1)) * 0.95  # 5% boost
-            results.sort(key=lambda r: float(r.get("distance", 1)))
+            # Post-rank: prefer specific scope over global at same distance
+            if scope != "any":
+                for r in results:
+                    if r.get("scope") == scope:
+                        r["distance"] = float(r.get("distance", 1)) * 0.95  # 5% boost
+                results.sort(key=lambda r: float(r.get("distance", 1)))
 
-        # Update access counts
-        if results:
-            ids = [r["id"] for r in results]
-            placeholders = ",".join(["%s"] * len(ids))
-            cur.execute(f"""
-                UPDATE fleet_memory
-                SET access_count = access_count + 1, last_accessed = NOW()
-                WHERE id IN ({placeholders})
-            """, ids)
+            # Update access counts
+            if results:
+                ids = [r["id"] for r in results]
+                placeholders = ",".join(["%s"] * len(ids))
+                cur.execute(f"""
+                    UPDATE fleet_memory
+                    SET access_count = access_count + 1, last_accessed = NOW()
+                    WHERE id IN ({placeholders})
+                """, ids)
 
     return to_json({
         "query": query_text[:200],
@@ -461,9 +483,9 @@ def write_fleet_memory(category: str, scope: str, content: str,
     and auto-supersedes conflicting memories using the superseded_by column.
     """
     vec = embed(content)
-    db = get_db()
-    with db.cursor() as cur:
-        # Check for near-duplicate (cosine distance < 0.15 = similarity > 0.85)
+
+    # Look up near-duplicates / candidate contradictions
+    with get_db() as db, db.cursor() as cur:
         cur.execute("""
             SELECT id, content, confidence, category,
                    VEC_COSINE_DISTANCE(memory_vec, %s) AS distance
@@ -474,57 +496,59 @@ def write_fleet_memory(category: str, scope: str, content: str,
         """, (str(vec), scope))
         nearby = cur.fetchall()
 
-        if nearby:
-            closest = nearby[0]
-            dist = float(closest["distance"])
+    # Case 1: near-duplicate merge — single UPDATE, atomic under autocommit.
+    if nearby and float(nearby[0]["distance"]) < 0.15:
+        closest = nearby[0]
+        with get_db() as db, db.cursor() as cur:
+            cur.execute("""
+                UPDATE fleet_memory
+                SET content = %s,
+                    confidence = GREATEST(confidence, %s),
+                    supporting_evidence_count = supporting_evidence_count + 1,
+                    source_refs = JSON_ARRAY_APPEND(
+                        COALESCE(source_refs, JSON_ARRAY()), '$', %s
+                    ),
+                    memory_vec = %s
+                WHERE id = %s
+            """, (content, confidence,
+                  json.dumps(source_refs or []),
+                  str(vec), closest["id"]))
+        return to_json({
+            "status": "updated_existing",
+            "memory_id": closest["id"],
+            "message": "Near-duplicate found. Merged with existing memory.",
+        })
 
-            if dist < 0.15:
-                # Near-duplicate: merge (strengthen existing memory)
-                cur.execute("""
-                    UPDATE fleet_memory
-                    SET content = %s,
-                        confidence = GREATEST(confidence, %s),
-                        supporting_evidence_count = supporting_evidence_count + 1,
-                        source_refs = JSON_ARRAY_APPEND(
-                            COALESCE(source_refs, JSON_ARRAY()), '$', %s
-                        ),
-                        memory_vec = %s
-                    WHERE id = %s
-                """, (content, confidence,
-                      json.dumps(source_refs or []),
-                      str(vec), closest["id"]))
-                return to_json({
-                    "status": "updated_existing",
-                    "memory_id": closest["id"],
-                    "message": "Near-duplicate found. Merged with existing memory.",
-                })
+    # Case 2: insert new memory; if it contradicts a prior one, supersede
+    # in the same transaction so concurrent readers never see an
+    # in-between state and a crash mid-flight rolls back cleanly.
+    db_conn = _get_pool().connection()
+    try:
+        db_conn.begin()
+        with db_conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO fleet_memory
+                    (category, scope, content, source_refs, confidence, memory_vec)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (category, scope, content,
+                  json.dumps(source_refs or []),
+                  confidence, str(vec)))
+            memory_id = cur.lastrowid
 
-            elif dist < 0.4 and closest["category"] == category:
-                # Moderate similarity + same category = potential contradiction.
-                # The new memory supersedes the old one.
+            if (nearby
+                    and float(nearby[0]["distance"]) < 0.4
+                    and nearby[0]["category"] == category):
                 cur.execute("""
                     UPDATE fleet_memory
                     SET status = 'superseded', superseded_by = %s
                     WHERE id = %s
-                """, (0, closest["id"]))  # Will update with real ID below
-
-        # Insert new memory
-        cur.execute("""
-            INSERT INTO fleet_memory
-                (category, scope, content, source_refs, confidence, memory_vec)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (category, scope, content,
-              json.dumps(source_refs or []),
-              confidence, str(vec)))
-        memory_id = cur.lastrowid
-
-        # Fix up the superseded_by pointer if we flagged a contradiction
-        if nearby and float(nearby[0]["distance"]) < 0.4 and nearby[0]["category"] == category:
-            cur.execute("""
-                UPDATE fleet_memory
-                SET superseded_by = %s
-                WHERE id = %s AND status = 'superseded' AND superseded_by = 0
-            """, (memory_id, nearby[0]["id"]))
+                """, (memory_id, nearby[0]["id"]))
+        db_conn.commit()
+    except Exception:
+        db_conn.rollback()
+        raise
+    finally:
+        db_conn.close()
 
     return to_json({
         "status": "created",
@@ -541,25 +565,25 @@ def get_charger_context(entity_id: str,
     if snapshot_types is None:
         snapshot_types = ["profile", "recent_anomalies"]
 
-    db = get_db()
-    with db.cursor() as cur:
-        placeholders = ",".join(["%s"] * len(snapshot_types))
-        cur.execute(f"""
-            SELECT snapshot_type, content, token_count, created_at,
-                   expires_at, is_stale
-            FROM context_snapshots
-            WHERE entity_type = %s AND entity_id = %s
-              AND snapshot_type IN ({placeholders})
-              AND expires_at > NOW()
-            ORDER BY snapshot_type
-        """, [entity_type, entity_id] + snapshot_types)
-        snapshots = list(cur.fetchall())
+    with get_db() as db:
+        with db.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(snapshot_types))
+            cur.execute(f"""
+                SELECT snapshot_type, content, token_count, created_at,
+                       expires_at, is_stale
+                FROM context_snapshots
+                WHERE entity_type = %s AND entity_id = %s
+                  AND snapshot_type IN ({placeholders})
+                  AND expires_at > NOW()
+                ORDER BY snapshot_type
+            """, [entity_type, entity_id] + snapshot_types)
+            snapshots = list(cur.fetchall())
 
     found_types = {s["snapshot_type"] for s in snapshots}
     missing = [t for t in snapshot_types if t not in found_types]
 
     for snap_type in missing:
-        content = _build_snapshot(entity_id, entity_type, snap_type, db)
+        content = _build_snapshot(entity_id, entity_type, snap_type)
         if content:
             snapshots.append({
                 "snapshot_type": snap_type,
@@ -580,10 +604,10 @@ def get_charger_context(entity_id: str,
 
 
 def _build_snapshot(entity_id: str, entity_type: str,
-                    snap_type: str, db) -> Optional[str]:
+                    snap_type: str) -> Optional[str]:
     """Build a context snapshot on the fly and cache it."""
     try:
-        with db.cursor() as cur:
+        with get_db() as db, db.cursor() as cur:
             if entity_type == "charger" and snap_type == "profile":
                 cur.execute("""
                     SELECT cr.*,
@@ -698,23 +722,23 @@ def _build_snapshot(entity_id: str, entity_type: str,
 def get_recent_windows(charger_id: str, hours_back: int = 6,
                        anomaly_only: bool = False) -> str:
     """Retrieve recent window aggregates including anomaly breakdown."""
-    db = get_db()
-    with db.cursor() as cur:
-        anomaly_clause = "AND anomaly_score > 0" if anomaly_only else ""
-        cur.execute(f"""
-            SELECT id, window_start, window_end, msg_count,
-                   avg_power_w, max_power_w, min_voltage_v, max_voltage_v,
-                   voltage_stddev, avg_current_a, max_temp_c, avg_temp_c,
-                   error_count, status_changes, distinct_errors,
-                   avg_fan_rpm, max_earth_leak, anomaly_flags, anomaly_score,
-                   anomaly_breakdown
-            FROM charger_windows
-            WHERE charger_id = %s
-              AND window_start > NOW() - INTERVAL %s HOUR
-              {anomaly_clause}
-            ORDER BY window_start DESC
-        """, (charger_id, hours_back))
-        windows = cur.fetchall()
+    with get_db() as db:
+        with db.cursor() as cur:
+            anomaly_clause = "AND anomaly_score > 0" if anomaly_only else ""
+            cur.execute(f"""
+                SELECT id, window_start, window_end, msg_count,
+                       avg_power_w, max_power_w, min_voltage_v, max_voltage_v,
+                       voltage_stddev, avg_current_a, max_temp_c, avg_temp_c,
+                       error_count, status_changes, distinct_errors,
+                       avg_fan_rpm, max_earth_leak, anomaly_flags, anomaly_score,
+                       anomaly_breakdown
+                FROM charger_windows
+                WHERE charger_id = %s
+                  AND window_start > NOW() - INTERVAL %s HOUR
+                  {anomaly_clause}
+                ORDER BY window_start DESC
+            """, (charger_id, hours_back))
+            windows = cur.fetchall()
 
     return to_json({
         "charger_id": charger_id,
@@ -728,26 +752,26 @@ def get_recent_windows(charger_id: str, hours_back: int = 6,
 def get_session_state(session_id: str,
                       user_id: Optional[str] = None) -> str:
     """Get or create session state."""
-    db = get_db()
-    with db.cursor() as cur:
-        cur.execute("SELECT * FROM session_state WHERE session_id = %s",
-                    (session_id,))
-        session = cur.fetchone()
+    with get_db() as db:
+        with db.cursor() as cur:
+            cur.execute("SELECT * FROM session_state WHERE session_id = %s",
+                        (session_id,))
+            session = cur.fetchone()
 
-        if not session:
-            cur.execute("""
-                INSERT INTO session_state (session_id, user_id)
-                VALUES (%s, %s)
-            """, (session_id, user_id))
-            session = {
-                "session_id": session_id,
-                "user_id": user_id,
-                "focus_chargers": None,
-                "focus_site": None,
-                "investigation_summary": None,
-                "token_budget": TOKEN_BUDGET_DEFAULT,
-                "tokens_used": 0,
-            }
+            if not session:
+                cur.execute("""
+                    INSERT INTO session_state (session_id, user_id)
+                    VALUES (%s, %s)
+                """, (session_id, user_id))
+                session = {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "focus_chargers": None,
+                    "focus_site": None,
+                    "investigation_summary": None,
+                    "token_budget": TOKEN_BUDGET_DEFAULT,
+                    "tokens_used": 0,
+                }
 
     return to_json(session)
 
@@ -774,12 +798,12 @@ def update_session_state(session_id: str, **kwargs) -> str:
 
     params.append(session_id)
 
-    db = get_db()
-    with db.cursor() as cur:
-        cur.execute(
-            f"UPDATE session_state SET {', '.join(set_clauses)} "
-            f"WHERE session_id = %s", params
-        )
+    with get_db() as db:
+        with db.cursor() as cur:
+            cur.execute(
+                f"UPDATE session_state SET {', '.join(set_clauses)} "
+                f"WHERE session_id = %s", params
+            )
 
     return to_json({"status": "updated", "session_id": session_id})
 
@@ -856,21 +880,21 @@ def assemble_context(session_id: str, charger_id: str,
                 + "\n".join(reasoning_lines)
             )
 
-    # 5. Fleet memory — single query with scope ranking
+    # 5. Fleet memory — single query with scope ranking.
+    # Parse site_id from the Tier 1 profile snapshot we already fetched
+    # rather than re-querying charger_registry.
     if tokens_remaining > 100:
-        db = get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT site_id, manufacturer, model, environment "
-                "FROM charger_registry WHERE charger_id = %s",
-                (charger_id,)
-            )
-            reg = cur.fetchone()
+        site_id = None
+        for snap in profile.get("snapshots", []):
+            content = snap.get("content", "")
+            if " at site " in content:
+                site_id = content.split(" at site ", 1)[1].split(".", 1)[0].strip()
+                break
 
-        if reg:
+        if site_id:
             # Try most specific scope; recall_fleet_memory now handles
             # IN (scope, 'global') in a single query
-            primary_scope = f"site:{reg['site_id']}"
+            primary_scope = f"site:{site_id}"
             memories = json.loads(recall_fleet_memory(
                 trigger_text, scope=primary_scope, limit=5
             ))
@@ -911,8 +935,10 @@ def assemble_context(session_id: str, charger_id: str,
 
 def consolidation_job():
     """Promote confirmed reasoning patterns into fleet memory."""
-    db = get_db()
-    with db.cursor() as cur:
+    import anthropic
+    client = anthropic.Anthropic()
+
+    with get_db() as db, db.cursor() as cur:
         cur.execute("""
             SELECT ar.charger_id, ar.site_id, ar.observation,
                    ar.hypothesis, ar.tags, ar.id,
@@ -936,12 +962,55 @@ def consolidation_job():
             if len(group) >= 3:
                 charger_ids = [g["charger_id"] for g in group]
                 sample = group[0]
-                content = (
+                fallback_content = (
                     f"Confirmed pattern across {len(group)} chargers "
                     f"({', '.join(charger_ids[:5])}): "
                     f"{sample['hypothesis'] or sample['observation']}. "
                     f"Tags: {tag_key}."
                 )
+                # Synthesize a cleaner natural-language description via Haiku.
+                # On any failure (rate limit, network, empty response) we fall
+                # back to the deterministic f-string — consolidation must not
+                # break on transient API errors.
+                try:
+                    group_summary = "\n".join(
+                        f"- {g['charger_id']}: observed {g['observation']!r}; "
+                        f"hypothesis {g['hypothesis']!r}"
+                        for g in group[:10]
+                    )
+                    response = client.messages.create(
+                        model=HAIKU_MODEL,
+                        max_tokens=200,
+                        system=(
+                            "You write concise pattern descriptions for an EV "
+                            "charger fleet memory store. Given a group of "
+                            "confirmed reasoning entries that share tags, "
+                            "synthesize a 2-3 sentence pattern statement that "
+                            "names the failure mode, references the number of "
+                            "affected chargers, and notes any common cause. "
+                            "Be specific and operational. Do not use bullet "
+                            "points or markdown."
+                        ),
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                f"Group of {len(group)} confirmed entries "
+                                f"sharing tags '{tag_key}':\n"
+                                f"{group_summary}\n\n"
+                                "Write a 2-3 sentence pattern description."
+                            ),
+                        }],
+                    )
+                    synth = "".join(
+                        b.text for b in response.content if b.type == "text"
+                    ).strip()
+                    content = synth if synth else fallback_content
+                except Exception as e:
+                    log.warning(
+                        f"Haiku pattern synthesis failed for tag_key={tag_key!r}: {e}; "
+                        f"using f-string fallback"
+                    )
+                    content = fallback_content
                 environments = {g["environment"] for g in group if g.get("environment")}
                 models = {f"{g['manufacturer']}-{g['model']}" for g in group
                           if g.get("manufacturer")}
@@ -977,8 +1046,7 @@ def cleanup_job():
     than 30 days, regardless of access frequency. Memories that decay
     below 0.3 confidence are deprecated.
     """
-    db = get_db()
-    with db.cursor() as cur:
+    with get_db() as db, db.cursor() as cur:
         # Expire inactive sessions
         cur.execute("""
             DELETE FROM session_state
@@ -1038,9 +1106,8 @@ def compaction_job():
     drifted close together over time (< 0.20 cosine distance), and
     consolidates supporting evidence counts.
     """
-    db = get_db()
     merged = 0
-    with db.cursor() as cur:
+    with get_db() as db, db.cursor() as cur:
         # Get all active scopes
         cur.execute("""
             SELECT DISTINCT scope FROM fleet_memory WHERE status = 'active'
@@ -1118,8 +1185,7 @@ def compaction_job():
 
 def refresh_snapshots_job(charger_ids: Optional[list] = None):
     """Refresh context snapshots for chargers with recent activity."""
-    db = get_db()
-    with db.cursor() as cur:
+    with get_db() as db, db.cursor() as cur:
         if charger_ids:
             placeholders = ",".join(["%s"] * len(charger_ids))
             cur.execute(f"""
@@ -1138,7 +1204,7 @@ def refresh_snapshots_job(charger_ids: Optional[list] = None):
     refreshed = 0
     for cid in active_chargers:
         for snap_type in ["profile", "recent_anomalies", "active_investigations"]:
-            _build_snapshot(cid, "charger", snap_type, db)
+            _build_snapshot(cid, "charger", snap_type)
             refreshed += 1
 
     return f"Refreshed {refreshed} snapshots for {len(active_chargers)} chargers."
@@ -1172,6 +1238,32 @@ def handle_tool_call(tool_name: str, tool_input: dict) -> str:
 # ============================================================================
 # AGENT LOOP (with circuit breaker + observability)
 # ============================================================================
+
+# Model identifiers used across this module. Sonnet handles open-ended
+# investigations; Haiku handles classification and summarization.
+SONNET_MODEL = "claude-sonnet-4-6"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _classify_trigger(trigger: str, client) -> str:
+    """Classify trigger as 'lookup' or 'investigation'.
+    Simple lookups (status checks, profile queries) can be answered
+    by Haiku alone. Investigations need Sonnet + tool loop."""
+    response = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=20,
+        system=(
+            "Classify the user's request as exactly one word: "
+            "'lookup' if it's a simple status/profile/history query "
+            "answerable from one or two tool calls, or 'investigation' "
+            "if it requires hypothesis formation, anomaly analysis, or "
+            "cross-referencing multiple data sources. Respond with one word."
+        ),
+        messages=[{"role": "user", "content": trigger}],
+    )
+    text = "".join(b.text for b in response.content if b.type == "text").strip().lower()
+    return "lookup" if "lookup" in text else "investigation"
+
 
 def run_agent(session_id: str, user_id: str, charger_id: str,
               trigger: str,
@@ -1225,6 +1317,21 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 """
 
     client = anthropic.Anthropic()
+
+    # Classify the trigger to pick the cheapest viable model.
+    # Simple lookups → Haiku + short loop; investigations → Sonnet + full loop.
+    classification = _classify_trigger(trigger, client)
+    if classification == "lookup":
+        loop_model = HAIKU_MODEL
+        max_tool_rounds = 5
+    else:
+        loop_model = SONNET_MODEL
+        max_tool_rounds = 15
+    log.info(
+        f"Trigger classified as '{classification}' for session {session_id}: "
+        f"model={loop_model}, max_tool_rounds={max_tool_rounds}"
+    )
+
     messages = [{"role": "user", "content": trigger}]
 
     tool_call_counts: dict[str, int] = {}
@@ -1233,7 +1340,7 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
     # Step 4: Agent loop with circuit breaker
     for iteration in range(1, max_tool_rounds + 1):
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=loop_model,
             max_tokens=2048,
             system=system_prompt,
             tools=tools_config["tools"],
@@ -1288,9 +1395,18 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
             })
         messages.append({"role": "user", "content": tool_results})
 
-    # Extract final text
+    # Force a clean final summary via Haiku (no tools). The loop's last
+    # assistant message can be empty — e.g. when we hit max_tool_rounds
+    # or the circuit breaker fires mid-investigation. One non-tool call
+    # always yields usable text and is cheap.
+    summary_response = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=1024,
+        system=system_prompt + "\n\nProvide a clean final summary of your findings. Do not call any tools.",
+        messages=messages,
+    )
     final_text = "\n".join(
-        b.text for b in assistant_content if b.type == "text"
+        b.text for b in summary_response.content if b.type == "text"
     )
 
     # Update session

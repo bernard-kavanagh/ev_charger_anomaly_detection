@@ -45,8 +45,7 @@ _NARROW = 41
 
 def find_top_anomalous_chargers(n: int) -> list[dict]:
     """Return top-N distinct chargers by highest anomaly_score in last 24h."""
-    db = get_db()
-    try:
+    with get_db() as db:
         with db.cursor() as cur:
             # Fetch more rows than N to allow dedup by charger_id
             cur.execute("""
@@ -60,8 +59,6 @@ def find_top_anomalous_chargers(n: int) -> list[dict]:
                 LIMIT %s
             """, (n * 10,))
             rows = cur.fetchall()
-    finally:
-        db.close()
 
     # Dedup: keep only the highest-scoring window per charger_id
     seen: set[str] = set()
@@ -79,8 +76,7 @@ def find_top_anomalous_chargers(n: int) -> list[dict]:
 
 def find_window_for_charger(charger_id: str) -> dict | None:
     """Return the most recent anomalous window for a specific charger."""
-    db = get_db()
-    try:
+    with get_db() as db:
         with db.cursor() as cur:
             cur.execute("""
                 SELECT charger_id, window_start, anomaly_score, anomaly_flags,
@@ -92,8 +88,6 @@ def find_window_for_charger(charger_id: str) -> dict | None:
                 LIMIT 1
             """, (charger_id,))
             return cur.fetchone()
-    finally:
-        db.close()
 
 
 # ---------------------------------------------------------------------------

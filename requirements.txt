@@ -1,5 +1,6 @@
 # Core — required for all components
 pymysql>=1.1.0,<2.0
+dbutils>=3.0.0,<4.0
 python-dotenv>=1.0.0,<2.0
 
 # Agent — required for running investigations

@@ -54,8 +54,7 @@ def _build_outage_text(row: dict) -> str:
 
 def bootstrap_outage_catalog():
     """Embed any outage_catalog rows that have NULL signature_vec."""
-    db = get_db()
-    try:
+    with get_db() as db:
         with db.cursor() as cur:
             cur.execute(
                 "SELECT id, pattern_name, category, severity, "
@@ -63,8 +62,6 @@ def bootstrap_outage_catalog():
                 "FROM outage_catalog WHERE signature_vec IS NULL"
             )
             rows = cur.fetchall()
-    finally:
-        db.close()
 
     if not rows:
         return
@@ -77,16 +74,13 @@ def bootstrap_outage_catalog():
         vec = embed(_build_outage_text(row))
         pairs.append((row["id"], vec))
 
-    db = get_db()
-    try:
+    with get_db() as db:
         with db.cursor() as cur:
             for row_id, vec in pairs:
                 cur.execute(
                     "UPDATE outage_catalog SET signature_vec = %s WHERE id = %s",
                     (str(vec), row_id)
                 )
-    finally:
-        db.close()
 
     print(f"Bootstrap: done ({len(rows)} row(s) embedded).", file=sys.stderr)
 
@@ -97,8 +91,7 @@ def bootstrap_outage_catalog():
 
 def find_most_anomalous_window() -> dict | None:
     """Return the highest-scoring charger_windows row in the last 24 hours."""
-    db = get_db()
-    try:
+    with get_db() as db:
         with db.cursor() as cur:
             cur.execute("""
                 SELECT charger_id, window_start, anomaly_score, anomaly_flags,
@@ -111,14 +104,11 @@ def find_most_anomalous_window() -> dict | None:
                 LIMIT 1
             """)
             return cur.fetchone()
-    finally:
-        db.close()
 
 
 def find_recent_anomalous_window(charger_id: str) -> dict | None:
     """Return the most recent anomalous window for a specific charger."""
-    db = get_db()
-    try:
+    with get_db() as db:
         with db.cursor() as cur:
             cur.execute("""
                 SELECT window_start, anomaly_score, anomaly_flags,
@@ -130,8 +120,6 @@ def find_recent_anomalous_window(charger_id: str) -> dict | None:
                 LIMIT 1
             """, (charger_id,))
             return cur.fetchone()
-    finally:
-        db.close()
 
 
 def build_trigger_from_window(charger_id: str, window: dict) -> str:
