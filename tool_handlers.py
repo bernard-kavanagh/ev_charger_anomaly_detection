@@ -174,6 +174,20 @@ def _safe_handler(func):
                 "tool": func.__name__,
                 "retryable": True,
             })
+        except TypeError as e:
+            # Schema mismatch from the model (missing/extra args). The
+            # agent can correct itself on the next turn — surface a
+            # retryable error rather than a crash-shaped one.
+            log.warning(
+                f"Invalid arguments for {func.__name__}: {e} "
+                f"(args={args}, kwargs={list(kwargs.keys())})"
+            )
+            return to_json({
+                "error": f"Invalid arguments for {func.__name__}: {e}",
+                "tool": func.__name__,
+                "retryable": True,
+                "provided_args": list(kwargs.keys()),
+            })
         except Exception as e:
             log.error(f"Error in {func.__name__}: {e}", exc_info=True)
             return to_json({
@@ -1293,7 +1307,22 @@ def handle_tool_call(tool_name: str, tool_input: dict) -> str:
     handler = TOOL_HANDLERS.get(tool_name)
     if not handler:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
-    return handler(**tool_input)
+    try:
+        return handler(**tool_input)
+    except TypeError as e:
+        # Schema-level mismatch: e.g. model omitted a required arg or
+        # passed an unexpected one. Bubble up a structured error so the
+        # agent can correct itself instead of crashing the wrapper.
+        log.warning(
+            "Tool input validation failed for %s with input keys %s: %s",
+            tool_name, list(tool_input.keys()), e,
+        )
+        return json.dumps({
+            "error": f"Invalid arguments for {tool_name}: {e}",
+            "tool": tool_name,
+            "retryable": True,
+            "provided_args": list(tool_input.keys()),
+        })
 
 
 # ============================================================================
