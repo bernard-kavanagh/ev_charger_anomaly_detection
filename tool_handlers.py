@@ -17,6 +17,7 @@ Changes from v1:
 
 import json
 import os
+import threading
 import time
 import logging
 from contextlib import contextmanager
@@ -79,14 +80,30 @@ def get_db():
 
 _EMBED_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 _embed_model = None
+_embed_model_lock = threading.Lock()
 
 
 def _get_embed_model():
+    # Double-checked locking: avoid taking the lock on the hot path once
+    # the singleton is initialized. The torch meta-tensor copy in
+    # SentenceTransformer.__init__ is not safe to run concurrently from
+    # multiple threads, so the first call must be serialized.
     global _embed_model
     if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer(_EMBED_MODEL_NAME)
+        with _embed_model_lock:
+            if _embed_model is None:
+                from sentence_transformers import SentenceTransformer
+                _embed_model = SentenceTransformer(_EMBED_MODEL_NAME)
     return _embed_model
+
+
+def warmup_embed_model() -> None:
+    """Load the embedding singleton on the calling thread.
+
+    Call this once from the main thread before spawning workers so the
+    racy first-init happens in a single-threaded context.
+    """
+    _get_embed_model()
 
 
 def embed(text: str) -> list[float]:

@@ -33,7 +33,7 @@ load_dotenv(find_dotenv())
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tool_handlers import run_agent, get_db  # noqa: E402
+from tool_handlers import run_agent, get_db, warmup_embed_model  # noqa: E402
 
 _WIDE = 43
 _NARROW = 41
@@ -310,6 +310,12 @@ def main():
     # ------------------------------------------------------------------
     # Concurrent execution
     # ------------------------------------------------------------------
+    # Initialize the SentenceTransformer singleton on the main thread.
+    # SentenceTransformer.__init__ does a torch meta-tensor copy that is
+    # not thread-safe; concurrent first-init from worker threads raises
+    # NotImplementedError on the losers.
+    warmup_embed_model()
+
     # ordered_results[index] = result dict, filled as futures complete
     ordered_results: dict[int, dict] = {}
     wall_start = time.monotonic()
