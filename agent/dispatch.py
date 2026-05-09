@@ -176,11 +176,25 @@ def print_fleet_summary(
     fleet_writes: int,
     wall_time: float,
     durations: list[float],
+    api_input_tokens: int,
+    api_output_tokens: int,
+    api_cache_creation_tokens: int,
+    api_cache_read_tokens: int,
 ):
     avg_dur = sum(durations) / len(durations) if durations else 0.0
     min_dur = min(durations) if durations else 0.0
     max_dur = max(durations) if durations else 0.0
     speedup = sum(durations) / wall_time if wall_time > 0 else 0.0
+
+    # Cache hit rate is read / (read + uncached + write). The denominator
+    # is what total input would have been at full price; the numerator is
+    # what was served at ~10% of that price.
+    total_input_eq = (
+        api_input_tokens + api_cache_creation_tokens + api_cache_read_tokens
+    )
+    cache_hit_pct = (
+        100.0 * api_cache_read_tokens / total_input_eq if total_input_eq else 0.0
+    )
 
     print(f"\n{'═' * _WIDE}", file=sys.stderr)
     print(f"Fleet Dispatch Summary", file=sys.stderr)
@@ -196,6 +210,14 @@ def print_fleet_summary(
         file=sys.stderr,
     )
     print(f"  Concurrency speedup:    ~{speedup:.1f}x vs sequential", file=sys.stderr)
+    print(f"  API input tokens:       {api_input_tokens:,} uncached", file=sys.stderr)
+    print(f"  API output tokens:      {api_output_tokens:,}", file=sys.stderr)
+    print(f"  Cache writes:           {api_cache_creation_tokens:,} tokens", file=sys.stderr)
+    print(
+        f"  Cache reads:            {api_cache_read_tokens:,} tokens "
+        f"({cache_hit_pct:.1f}% hit rate)",
+        file=sys.stderr,
+    )
     print(f"{'═' * _WIDE}", file=sys.stderr)
 
 
@@ -371,6 +393,10 @@ def main():
     total_checkpoints = 0
     total_fleet_writes = 0
     durations: list[float] = []
+    api_input_total = 0
+    api_output_total = 0
+    api_cache_create_total = 0
+    api_cache_read_total = 0
 
     for i in range(n):
         result = ordered_results[i]
@@ -384,6 +410,12 @@ def main():
         if dur > 0:
             durations.append(dur)
 
+        obs = result.get("observability") or {}
+        api_input_total += obs.get("api_input_tokens", 0)
+        api_output_total += obs.get("api_output_tokens", 0)
+        api_cache_create_total += obs.get("api_cache_creation_tokens", 0)
+        api_cache_read_total += obs.get("api_cache_read_tokens", 0)
+
     # ------------------------------------------------------------------
     # Fleet summary
     # ------------------------------------------------------------------
@@ -394,6 +426,10 @@ def main():
         fleet_writes=total_fleet_writes,
         wall_time=wall_time,
         durations=durations,
+        api_input_tokens=api_input_total,
+        api_output_tokens=api_output_total,
+        api_cache_creation_tokens=api_cache_create_total,
+        api_cache_read_tokens=api_cache_read_total,
     )
 
 

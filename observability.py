@@ -87,6 +87,8 @@ class AgentObserver:
         # size of the assembled prompt, not API spend).
         self.api_input_tokens: int = 0
         self.api_output_tokens: int = 0
+        self.api_cache_creation_tokens: int = 0
+        self.api_cache_read_tokens: int = 0
         self.api_calls_by_role: dict[str, int] = {}
 
     def _emit(self, event_type: str, data: dict):
@@ -178,19 +180,33 @@ class AgentObserver:
     # --- Anthropic API usage ---
 
     def record_api_call(self, role: str, model: str,
-                        input_tokens: int, output_tokens: int):
+                        input_tokens: int, output_tokens: int,
+                        cache_creation_input_tokens: int = 0,
+                        cache_read_input_tokens: int = 0):
         """Record an Anthropic API call's token usage.
 
         role: one of 'classify', 'loop', 'summary'.
+
+        cache_creation_input_tokens: tokens written to the prompt cache
+        on this call (billed at ~1.25x base input). Non-zero on the first
+        call of a cacheable run; zero thereafter.
+
+        cache_read_input_tokens: tokens served from the prompt cache on
+        this call (billed at ~0.1x base input). Non-zero on subsequent
+        calls with the same cached prefix.
         """
         self.api_input_tokens += input_tokens
         self.api_output_tokens += output_tokens
+        self.api_cache_creation_tokens += cache_creation_input_tokens
+        self.api_cache_read_tokens += cache_read_input_tokens
         self.api_calls_by_role[role] = self.api_calls_by_role.get(role, 0) + 1
         self._emit("api_call", {
             "role": role,
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
         })
 
     # --- Completion ---
@@ -212,6 +228,8 @@ class AgentObserver:
             "context_tokens": self.context_tokens_used,
             "api_input_tokens": self.api_input_tokens,
             "api_output_tokens": self.api_output_tokens,
+            "api_cache_creation_tokens": self.api_cache_creation_tokens,
+            "api_cache_read_tokens": self.api_cache_read_tokens,
             "api_calls_by_role": dict(self.api_calls_by_role),
             "response_tokens": response_tokens,
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
@@ -238,5 +256,7 @@ class AgentObserver:
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
             "api_input_tokens": self.api_input_tokens,
             "api_output_tokens": self.api_output_tokens,
+            "api_cache_creation_tokens": self.api_cache_creation_tokens,
+            "api_cache_read_tokens": self.api_cache_read_tokens,
             "api_calls_by_role": dict(self.api_calls_by_role),
         }

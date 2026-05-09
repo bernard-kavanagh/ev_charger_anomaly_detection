@@ -1453,12 +1453,25 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
     tool_call_counts: dict[str, int] = {}
     last_tools: list[str] = []  # Track consecutive tool calls
 
-    # Step 4: Agent loop with circuit breaker
+    # Step 4: Agent loop with circuit breaker.
+    # The system prompt is byte-identical across all iterations of this
+    # investigation, so we cache it. Render order is tools → system →
+    # messages; cache_control on the system block caches both tools and
+    # system together. Iteration 1 pays the ~1.25x write premium;
+    # iterations 2..N read at ~0.1x, which dominates the saving on long
+    # loops. The system prompt comfortably exceeds Sonnet 4.6's 2048-
+    # token cache minimum once context is assembled.
+    cached_system = [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
     for iteration in range(1, max_tool_rounds + 1):
         response = client.messages.create(
             model=loop_model,
             max_tokens=2048,
-            system=system_prompt,
+            system=cached_system,
             tools=tools_config["tools"],
             messages=messages,
         )
@@ -1467,6 +1480,12 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
             model=loop_model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            cache_creation_input_tokens=getattr(
+                response.usage, "cache_creation_input_tokens", 0
+            ) or 0,
+            cache_read_input_tokens=getattr(
+                response.usage, "cache_read_input_tokens", 0
+            ) or 0,
         )
 
         assistant_content = response.content
@@ -1517,15 +1536,100 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
             })
         messages.append({"role": "user", "content": tool_results})
 
-    # Force a clean final summary via Haiku (no tools). The loop's last
-    # assistant message can be empty — e.g. when we hit max_tool_rounds
-    # or the circuit breaker fires mid-investigation. One non-tool call
-    # always yields usable text and is cheap.
+    # Force a clean final summary via Haiku, but DO NOT replay the full
+    # `messages` array. The loop already wrote a structured checkpoint
+    # to agent_reasoning; re-derive the report from that row instead.
+    # Replaying messages cost ~30-50k input tokens per investigation
+    # (the whole conversation, growing with each iteration) and Haiku
+    # frequently returned zero text blocks when given that bloated,
+    # mixed-content payload — the empty-Investigation-Report bug.
+    checkpoint = None
+    try:
+        with get_db() as db, db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, charger_id, observation, hypothesis,
+                       evidence_refs, confidence, resolution, tags,
+                       created_at
+                FROM agent_reasoning
+                WHERE session_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            )
+            checkpoint = cur.fetchone()
+    except Exception as e:
+        log.warning(
+            "Could not fetch checkpoint for session %s: %s", session_id, e
+        )
+
+    if checkpoint:
+        summary_prompt = (
+            f"Write a final investigation report for charger {charger_id}.\n\n"
+            f"Original alert: {trigger}\n\n"
+            "Investigation checkpoint:\n"
+            f"  Observation: {checkpoint['observation']}\n"
+            f"  Hypothesis: {checkpoint.get('hypothesis') or '(no hypothesis)'}\n"
+            f"  Confidence: {checkpoint['confidence']}\n"
+            f"  Resolution: {checkpoint['resolution']}\n"
+            f"  Evidence: {checkpoint.get('evidence_refs') or '[]'}\n"
+            f"  Tags: {checkpoint.get('tags') or '[]'}\n"
+            f"  Reasoning ID: {checkpoint['id']}\n\n"
+            "Write a 3-5 paragraph report covering: what was observed, "
+            "the diagnosed cause, the recommended action, and any "
+            "fleet-wide implications. Reference the evidence and the "
+            "reasoning ID."
+        )
+    else:
+        # Fallback: no checkpoint was written (rare — circuit breaker
+        # fired before any write_reasoning_checkpoint call, or the model
+        # never reached a checkpoint). Pull the last assistant text
+        # block from the loop so the report still reflects what the
+        # agent was reasoning about.
+        last_text = ""
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                last_text = content
+                break
+            if not content:
+                continue
+            for block in content:
+                block_type = getattr(block, "type", None) or (
+                    block.get("type") if isinstance(block, dict) else None
+                )
+                if block_type != "text":
+                    continue
+                block_text = getattr(block, "text", None) or (
+                    block.get("text") if isinstance(block, dict) else None
+                )
+                if block_text:
+                    last_text = block_text
+                    break
+            if last_text:
+                break
+
+        summary_prompt = (
+            f"Write a final investigation report for charger {charger_id}.\n\n"
+            f"Original alert: {trigger}\n\n"
+            "No reasoning checkpoint was written for this session — the "
+            "investigation may have been interrupted. Partial reasoning "
+            f"from the agent:\n\n{last_text or '(no reasoning text captured)'}\n\n"
+            "Write a 2-3 paragraph report describing what was "
+            "investigated and what remains uncertain or unfinished."
+        )
+
     summary_response = client.messages.create(
         model=HAIKU_MODEL,
         max_tokens=1024,
-        system=system_prompt + "\n\nProvide a clean final summary of your findings. Do not call any tools.",
-        messages=messages,
+        system=(
+            "You are an EV charger fleet diagnostic report writer. "
+            "Produce concise, operational reports for field technicians."
+        ),
+        messages=[{"role": "user", "content": summary_prompt}],
     )
     obs.record_api_call(
         role="summary",
