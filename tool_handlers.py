@@ -815,7 +815,16 @@ def get_session_state(session_id: str,
 
 @_safe_handler
 def update_session_state(session_id: str, **kwargs) -> str:
-    """Update session state fields."""
+    """Upsert session state fields.
+
+    Idempotent: if no row exists for session_id, INSERT creates one and
+    DB defaults fill columns the caller didn't pass (started_at,
+    last_active, token_budget, tokens_used). If the row exists,
+    ON DUPLICATE KEY UPDATE applies only the passed columns — same
+    semantics as the previous UPDATE-only path. This prevents zero-row
+    UPDATEs from silently dropping telemetry like tokens_used when the
+    session row hasn't been materialized by an earlier tool call.
+    """
     allowed = {"focus_chargers", "focus_site",
                "investigation_summary", "tokens_used"}
     updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
@@ -823,24 +832,28 @@ def update_session_state(session_id: str, **kwargs) -> str:
     if not updates:
         return to_json({"status": "no_changes"})
 
-    set_clauses = []
-    params = []
+    cols = ["session_id"]
+    placeholders = ["%s"]
+    params = [session_id]
+    update_clauses = []
     for k, v in updates.items():
+        cols.append(k)
+        placeholders.append("%s")
         if k == "focus_chargers":
-            set_clauses.append(f"{k} = %s")
             params.append(json.dumps(v))
         else:
-            set_clauses.append(f"{k} = %s")
             params.append(v)
+        update_clauses.append(f"{k} = VALUES({k})")
 
-    params.append(session_id)
+    sql = (
+        f"INSERT INTO session_state ({', '.join(cols)}) "
+        f"VALUES ({', '.join(placeholders)}) "
+        f"ON DUPLICATE KEY UPDATE {', '.join(update_clauses)}"
+    )
 
     with get_db() as db:
         with db.cursor() as cur:
-            cur.execute(
-                f"UPDATE session_state SET {', '.join(set_clauses)} "
-                f"WHERE session_id = %s", params
-            )
+            cur.execute(sql, params)
 
     return to_json({"status": "updated", "session_id": session_id})
 
