@@ -82,6 +82,13 @@ class AgentObserver:
         self.loop_iterations: int = 0
         self.circuit_breaker_triggered: bool = False
 
+        # Anthropic API usage (input/output tokens charged by the API),
+        # tracked separately from context_tokens_used (which measures the
+        # size of the assembled prompt, not API spend).
+        self.api_input_tokens: int = 0
+        self.api_output_tokens: int = 0
+        self.api_calls_by_role: dict[str, int] = {}
+
     def _emit(self, event_type: str, data: dict):
         """Emit a structured log event."""
         entry = {
@@ -168,6 +175,24 @@ class AgentObserver:
             "tool": tool_name,
         })
 
+    # --- Anthropic API usage ---
+
+    def record_api_call(self, role: str, model: str,
+                        input_tokens: int, output_tokens: int):
+        """Record an Anthropic API call's token usage.
+
+        role: one of 'classify', 'loop', 'summary'.
+        """
+        self.api_input_tokens += input_tokens
+        self.api_output_tokens += output_tokens
+        self.api_calls_by_role[role] = self.api_calls_by_role.get(role, 0) + 1
+        self._emit("api_call", {
+            "role": role,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        })
+
     # --- Completion ---
 
     def agent_complete(self, response_tokens: int = 0):
@@ -185,6 +210,9 @@ class AgentObserver:
             "tool_call_counts": self.tool_calls,
             "avg_tool_latencies_ms": avg_latencies,
             "context_tokens": self.context_tokens_used,
+            "api_input_tokens": self.api_input_tokens,
+            "api_output_tokens": self.api_output_tokens,
+            "api_calls_by_role": dict(self.api_calls_by_role),
             "response_tokens": response_tokens,
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
             "avg_vector_distance": (
@@ -208,4 +236,7 @@ class AgentObserver:
             "context_tokens": self.context_tokens_used,
             "context_sources": self.context_sources,
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
+            "api_input_tokens": self.api_input_tokens,
+            "api_output_tokens": self.api_output_tokens,
+            "api_calls_by_role": dict(self.api_calls_by_role),
         }

@@ -1018,6 +1018,13 @@ def consolidation_job():
                             ),
                         }],
                     )
+                    log.info(
+                        "consolidation api_call: model=%s tag_key=%r "
+                        "input_tokens=%d output_tokens=%d",
+                        HAIKU_MODEL, tag_key,
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                    )
                     synth = "".join(
                         b.text for b in response.content if b.type == "text"
                     ).strip()
@@ -1262,7 +1269,7 @@ SONNET_MODEL = "claude-sonnet-4-6"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
-def _classify_trigger(trigger: str, client) -> str:
+def _classify_trigger(trigger: str, client, obs: Optional[AgentObserver] = None) -> str:
     """Classify trigger as 'lookup' or 'investigation'.
     Simple lookups (status checks, profile queries) can be answered
     by Haiku alone. Investigations need Sonnet + tool loop."""
@@ -1278,6 +1285,13 @@ def _classify_trigger(trigger: str, client) -> str:
         ),
         messages=[{"role": "user", "content": trigger}],
     )
+    if obs is not None:
+        obs.record_api_call(
+            role="classify",
+            model=HAIKU_MODEL,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
     text = "".join(b.text for b in response.content if b.type == "text").strip().lower()
     return "lookup" if "lookup" in text else "investigation"
 
@@ -1337,7 +1351,7 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 
     # Classify the trigger to pick the cheapest viable model.
     # Simple lookups → Haiku + short loop; investigations → Sonnet + full loop.
-    classification = _classify_trigger(trigger, client)
+    classification = _classify_trigger(trigger, client, obs)
     if classification == "lookup":
         loop_model = HAIKU_MODEL
         max_tool_rounds = 5
@@ -1362,6 +1376,12 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
             system=system_prompt,
             tools=tools_config["tools"],
             messages=messages,
+        )
+        obs.record_api_call(
+            role="loop",
+            model=loop_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
         )
 
         assistant_content = response.content
@@ -1422,16 +1442,26 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
         system=system_prompt + "\n\nProvide a clean final summary of your findings. Do not call any tools.",
         messages=messages,
     )
+    obs.record_api_call(
+        role="summary",
+        model=HAIKU_MODEL,
+        input_tokens=summary_response.usage.input_tokens,
+        output_tokens=summary_response.usage.output_tokens,
+    )
     final_text = "\n".join(
         b.text for b in summary_response.content if b.type == "text"
     )
 
-    # Update session
+    # Update session. tokens_used is the total Anthropic API tokens
+    # (input + output) consumed by this investigation, not the size of
+    # the assembled prompt — that lives in `context_tokens` in the
+    # return dict.
+    api_total_tokens = obs.api_input_tokens + obs.api_output_tokens
     update_session_state(
         session_id,
         focus_chargers=[charger_id],
         investigation_summary=final_text[:500],
-        tokens_used=ctx["tokens_used"],
+        tokens_used=api_total_tokens,
     )
 
     obs.agent_complete()
@@ -1441,5 +1471,8 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
         "tool_calls": tool_call_counts,
         "context_sources": ctx["sources"],
         "context_tokens": ctx["tokens_used"],
+        "api_input_tokens": obs.api_input_tokens,
+        "api_output_tokens": obs.api_output_tokens,
+        "api_calls_by_role": dict(obs.api_calls_by_role),
         "observability": obs.summary(),
     }
