@@ -829,6 +829,23 @@ def update_session_state(session_id: str, **kwargs) -> str:
 # CONTEXT ASSEMBLY (with safety margin)
 # ============================================================================
 
+def _summarize_error(err: str) -> str:
+    """Compress a tool error message into a short sentinel tag.
+
+    The full message goes to logs; this short form rides in `sources`
+    so the model itself can see in its system prompt that retrieval
+    was degraded.
+    """
+    text = (err or "").lower()
+    if "meta tensor" in text:
+        return "meta_tensor"
+    if "database" in text:
+        return "database"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    return "unknown"
+
+
 def assemble_context(session_id: str, charger_id: str,
                      trigger_text: str,
                      token_budget: int = TOKEN_BUDGET_DEFAULT) -> dict:
@@ -878,24 +895,34 @@ def assemble_context(session_id: str, charger_id: str,
             trigger_text, charger_id=charger_id,
             resolution_filter="confirmed", limit=3
         ))
-        reasoning_lines = []
-        for r in similar.get("diagnoses", []):
-            line = (
-                f"- [{r['created_at']}] Observed: {r['observation'][:120]}. "
-                f"Hypothesis: {(r['hypothesis'] or 'none')[:120]}. "
-                f"Resolution: {r['resolution']}, confidence: {r['confidence']}. "
-                f"(similarity: {r['similarity']})"
+        if "error" in similar:
+            err_msg = _summarize_error(similar["error"])
+            sentinel = f"prior_diagnoses:ERROR:{err_msg}"
+            sources.append(sentinel)
+            log.warning(
+                "assemble_context: Tier 4 (search_prior_diagnoses) "
+                "failed for charger %s: %s",
+                charger_id, similar["error"],
             )
-            line_tokens = count_tokens(line)
-            if line_tokens <= tokens_remaining:
-                reasoning_lines.append(line)
-                tokens_remaining -= line_tokens
-                sources.append(f"prior_diagnosis:{r['id']}")
-        if reasoning_lines:
-            sections.append(
-                "## Prior confirmed diagnoses (similar cases)\n"
-                + "\n".join(reasoning_lines)
-            )
+        else:
+            reasoning_lines = []
+            for r in similar.get("diagnoses", []):
+                line = (
+                    f"- [{r['created_at']}] Observed: {r['observation'][:120]}. "
+                    f"Hypothesis: {(r['hypothesis'] or 'none')[:120]}. "
+                    f"Resolution: {r['resolution']}, confidence: {r['confidence']}. "
+                    f"(similarity: {r['similarity']})"
+                )
+                line_tokens = count_tokens(line)
+                if line_tokens <= tokens_remaining:
+                    reasoning_lines.append(line)
+                    tokens_remaining -= line_tokens
+                    sources.append(f"prior_diagnosis:{r['id']}")
+            if reasoning_lines:
+                sections.append(
+                    "## Prior confirmed diagnoses (similar cases)\n"
+                    + "\n".join(reasoning_lines)
+                )
 
     # 5. Fleet memory — single query with scope ranking.
     # Parse site_id from the Tier 1 profile snapshot we already fetched
@@ -915,24 +942,34 @@ def assemble_context(session_id: str, charger_id: str,
             memories = json.loads(recall_fleet_memory(
                 trigger_text, scope=primary_scope, limit=5
             ))
-            memory_lines = []
-            for m in memories.get("memories", []):
-                line = (
-                    f"- [{m['category']}, {m['scope']}] "
-                    f"{m['content'][:150]} "
-                    f"(confidence: {m['confidence']}, "
-                    f"evidence: {m['supporting_evidence_count']}x)"
+            if "error" in memories:
+                err_msg = _summarize_error(memories["error"])
+                sentinel = f"fleet_memory:ERROR:{err_msg}"
+                sources.append(sentinel)
+                log.warning(
+                    "assemble_context: Tier 5 (recall_fleet_memory) "
+                    "failed for charger %s: %s",
+                    charger_id, memories["error"],
                 )
-                line_tokens = count_tokens(line)
-                if line_tokens <= tokens_remaining:
-                    memory_lines.append(line)
-                    tokens_remaining -= line_tokens
-                    sources.append(f"fleet_memory:{m['id']}")
-            if memory_lines:
-                sections.append(
-                    "## Fleet knowledge (relevant to this charger)\n"
-                    + "\n".join(memory_lines)
-                )
+            else:
+                memory_lines = []
+                for m in memories.get("memories", []):
+                    line = (
+                        f"- [{m['category']}, {m['scope']}] "
+                        f"{m['content'][:150]} "
+                        f"(confidence: {m['confidence']}, "
+                        f"evidence: {m['supporting_evidence_count']}x)"
+                    )
+                    line_tokens = count_tokens(line)
+                    if line_tokens <= tokens_remaining:
+                        memory_lines.append(line)
+                        tokens_remaining -= line_tokens
+                        sources.append(f"fleet_memory:{m['id']}")
+                if memory_lines:
+                    sections.append(
+                        "## Fleet knowledge (relevant to this charger)\n"
+                        + "\n".join(memory_lines)
+                    )
 
     system_context = "\n\n".join(sections)
     tokens_used = effective_budget(token_budget) - tokens_remaining
