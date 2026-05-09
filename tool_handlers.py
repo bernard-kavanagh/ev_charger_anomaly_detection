@@ -41,27 +41,33 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _pool = None
+_pool_lock = threading.Lock()
 
 
 def _get_pool():
+    # Double-checked locking: PooledDB singleton init is not safe to run
+    # concurrently from multiple threads (creator/connection state is
+    # mutated in __init__). The lock serializes the first call.
     global _pool
     if _pool is None:
-        ssl_ca = os.environ.get("TIDB_SSL_CA")
-        _pool = PooledDB(
-            creator=pymysql,
-            maxconnections=20,
-            mincached=2,
-            maxcached=5,
-            blocking=True,
-            host=os.environ["TIDB_HOST"],
-            port=int(os.environ.get("TIDB_PORT", 4000)),
-            user=os.environ["TIDB_USER"],
-            password=os.environ["TIDB_PASSWORD"],
-            database=os.environ["TIDB_DATABASE"],
-            ssl={"ca": ssl_ca} if ssl_ca else None,
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=True,
-        )
+        with _pool_lock:
+            if _pool is None:
+                ssl_ca = os.environ.get("TIDB_SSL_CA")
+                _pool = PooledDB(
+                    creator=pymysql,
+                    maxconnections=20,
+                    mincached=2,
+                    maxcached=5,
+                    blocking=True,
+                    host=os.environ["TIDB_HOST"],
+                    port=int(os.environ.get("TIDB_PORT", 4000)),
+                    user=os.environ["TIDB_USER"],
+                    password=os.environ["TIDB_PASSWORD"],
+                    database=os.environ["TIDB_DATABASE"],
+                    ssl={"ca": ssl_ca} if ssl_ca else None,
+                    cursorclass=pymysql.cursors.DictCursor,
+                    autocommit=True,
+                )
     return _pool
 
 
