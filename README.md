@@ -4,7 +4,20 @@ Single-cluster TiDB Cloud architecture for streaming IoT telemetry from 20,000 O
 
 This platform implements the **cognitive foundation** architecture — a three-tier memory structure (episodic, semantic, procedural) with five custodial duties, running on a unified data substrate. It solves the **Memory Wall**: the infrastructure problem caused by stateless models on fragmented stacks.
 
+**v3 (May 2026):** Routing layer (Haiku shortcut path), Tier 5 graceful degradation, hard token caps on seed assembly, slim summary call, system prompt caching, charger registry write-on-create. See [AGENT_LIFECYCLE.md](AGENT_LIFECYCLE.md) for the full agent flow, empirical results from a multi-cluster experiment, and the reframed cost/quality thesis.
+
 **v2 (April 2026):** Hybrid search, contradiction resolution, fleet memory compaction, anomaly explainability, data validation, structured observability, and 36 unit tests. See [UPGRADE.md](UPGRADE.md) for the full changelog.
+
+## Validated thesis (post-experiment)
+
+The cognitive foundation provides four measurable benefits:
+
+1. **Persistent fleet awareness** — cluster recognition, recurrence detection, and cross-charger evidence chains that stateless agents cannot produce. Universal across all cluster states tested.
+2. **Higher-confidence diagnoses** — warm investigations run at 0.93–0.99 confidence vs 0.72–0.78 cold. Same model, same telemetry, stronger conclusions when validating priors are available.
+3. **~75% dollar-cost reduction** at steady state, via routing high-confidence pattern matches to a Haiku shortcut path. Mechanism: model substitution (Sonnet → Haiku), not pure token reduction.
+4. **~40% wall-clock latency reduction** on the shortcut path. Operator-facing.
+
+Token reductions vary by fleet state (~31% on 3-week production fleets, ~57% on smaller warmed clusters). The dollar saving is dominated by the model swap and holds across all states tested. Cold clusters need a 15-25 dispatch warm-up before shortcuts fire reliably; production clusters with accumulated memory route 100% shortcut from the first dispatch.
 
 ---
 
@@ -39,6 +52,9 @@ Kafka (ocpp-telemetry)
                                             │  run_agent.py --auto    │
                                             │  dispatch.py --top 5    │
                                             │  + hybrid search        │
+                                            │  + routing layer        │
+                                            │    (Sonnet ↔ Haiku)     │
+                                            │  + system prompt cache  │
                                             │  + circuit breaker      │
                                             │  + observability        │
                                             └─────────────────────────┘
@@ -298,21 +314,45 @@ All vector columns: `VECTOR(384)`, HNSW cosine index.
 | `get_session_state` | Read current session investigation state |
 | `update_session_state` | Write updated focus chargers and summary |
 
+### Agent lifecycle and empirical results
+
+For the full agent flow (trigger → context assembly → routing decision → loop → summary), the empirical validation across two clusters, and the reframed cost/quality thesis, see [AGENT_LIFECYCLE.md](AGENT_LIFECYCLE.md). It anchors every claim in this README to actual measured dispatch data.
+
 ### Context Assembly (Infrastructure-Level)
 
 `assemble_context()` in `tool_handlers.py` builds the agent's system prompt under a 4,000-token hard cap (3,600 effective after 10% safety margin), loading sources in priority order:
 
-| Priority | Source | Typical tokens |
-|---|---|---|
-| 1 | Charger profile (registry + snapshots) | ~80 |
-| 2 | Recent anomaly windows + breakdown | ~100–300 |
-| 3 | Active investigations (non-superseded) | ~100–200 |
-| 4 | Prior confirmed diagnoses (hybrid search) | ~200–500 |
-| 5 | Fleet knowledge (single-query scoped recall) | ~100–300 |
+| Priority | Source | Typical tokens | Notes |
+|---|---|---|---|
+| 1 | Charger profile (registry + snapshots) | ~80 | |
+| 2 | Recent anomaly windows + breakdown | ~100–300 | |
+| 3 | Active investigations (non-superseded) | ~100–200 | |
+| 4 | Prior confirmed diagnoses (hybrid search) | ~200–500 | charger-scoped |
+| 5 | Fleet knowledge (single-query scoped recall) | **capped at 500** | top-3 entries, content truncated to 80 chars (R1+R2) |
 
-Total: ~580–1,380 tokens, leaving 2,200+ for reasoning and response.
+The R1+R2 caps on Tier 5 are critical: without them, the seed inflated proportionally as `fleet_memory` grew, with per-investigation cost climbing +54% across a 10-dispatch warm-up. With caps, the seed stays constant-size regardless of underlying memory volume.
 
-Context assembly runs **before** the model is invoked — zero LLM calls, pure SQL. The model never decides what to remember. The platform decides for it. This eliminates the **Token Tax**: the quadratic cost of re-assembling context from scratch on every invocation.
+Tier 5 also degrades gracefully: when `site_id` parsing fails (e.g. registry missing the charger), it falls back to `scope="any"` instead of skipping the tier entirely.
+
+Context assembly runs **before** the model is invoked — zero LLM calls, pure SQL, ~50ms. The model never decides what to remember. The platform decides for it.
+
+This eliminates the **Token Tax** in its narrow definition: the runtime cost of re-assembling context from scratch on every invocation. **Per-investigation API spend** is governed separately by the routing layer (below), not by context assembly.
+
+### Routing Layer
+
+After context assembly, code (not the model) inspects the top fleet memory matches and decides which model and how many tool rounds to use:
+
+| Path | Trigger | Model | Tool rounds | Use case |
+|---|---|---|---:|---|
+| **SHORTCUT** | Any fleet match passes `confidence ≥ 0.85` AND `similarity ≥ 0.55` | Haiku | 3 | High-confidence pattern match — verify and checkpoint |
+| **LOOKUP** | Trigger classifier flags status query | Haiku | 5 | Simple status/profile queries |
+| **EXPLORE** | Default — no high-confidence match | Sonnet | 15 | Novel pattern discovery |
+
+The SHORTCUT path drives the architecture's measurable cost reduction. It substitutes Haiku ($1/$5 per M) for Sonnet ($3/$15 per M) when the cognitive foundation has already recognized the pattern. The shortcut also skips the classify call entirely — saving ~50 tokens per investigation and eliminating one round-trip.
+
+The routing layer scans all returned fleet matches (not just top-by-similarity) and picks the highest-confidence eligible entry. This is necessary because the most-similar entry isn't always the most-confident — a generic 0.72-confidence pattern with rich vocabulary overlap can outrank a charger-specific 0.97-confidence entry in cosine space.
+
+See `tool_handlers.py:run_agent` for implementation, `AGENT_LIFECYCLE.md` for empirical validation.
 
 ### Custodial Duties (Memory Lifecycle)
 
@@ -324,6 +364,8 @@ Context assembly runs **before** the model is invoked — zero LLM calls, pure S
 6. **Forgetting:** TTL policies cap storage at ~960M rows. 90-day zero-access deprecation. Expired context snapshots pruned automatically.
 
 The platform maintains memory through **five custodial duties**: write control (outcomes only), deduplication (cosine < 0.15), reconciliation (`superseded_by` chains), confidence decay (5% monthly, auto-deprecated below 0.30), and compaction (weekly re-clustering). These are SQL operations inside the cluster — not LLM calls, not external services.
+
+> **Time-scale note:** The custodial duties operate at human time-scales (monthly decay, weekly compaction). They cap the *long-term equilibrium* size of `fleet_memory`, not per-investigation cost during a single dispatch loop. Per-investigation cost is governed by the R1+R2 caps on Tier 5 (read-side, immediate) and the routing layer (model selection). The duties keep the underlying store healthy; the routing layer makes investigations cheap.
 
 ### Hybrid search
 
@@ -375,6 +417,9 @@ See `UPGRADE.md` for the full changelog.
 - **Semantic banding for embeddings.** `text_bander.py` converts raw metrics to natural language ("slightly elevated earth leakage", "error storm"). This is the single source of truth — both `embedding_service.py` and `stream_telemetry.py` import from the same module.
 - **384-dim all-MiniLM-L6-v2.** Runs locally, no API key, no rate limits, no per-token cost.
 - **Memory is infrastructure, not a feature.** Write control, deduplication, reconciliation, decay, compaction, and forgetting are all implemented as explicit lifecycle mechanisms — not bolted-on afterthoughts.
+- **Routing is external to the LLM.** Sonnet doesn't self-shortcut on familiar patterns — it uses richer context to do *more* work, not less. The routing layer reads the cognitive foundation's top match and switches models in code. This is what makes the architecture's cost benefit measurable rather than hoped-for.
+- **Bounded seed regardless of memory size.** Tier 5 is hard-capped at 500 tokens (R1) with content truncated to 80 chars (R2). The seed advertises that fleet patterns exist; the agent retrieves full content via `recall_fleet_memory` if needed. Without these caps, the seed inflates as memory grows and per-investigation cost climbs across runs.
+- **Three measured dimensions for cost.** Tokens, dollars, and wall-clock latency don't move together. The dollar saving (~75% on production fleets) is the strongest claim because it's driven by the Sonnet → Haiku model swap, not just token volume.
 
 ---
 
