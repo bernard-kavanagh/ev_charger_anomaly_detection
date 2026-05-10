@@ -622,8 +622,79 @@ class DirectWriter:
         )
 
 
+def _register_charger_fleet(db, fleet: "FleetSimulator"):
+    """Ensure every charger in the simulated fleet has a row in
+    charger_registry. Idempotent via INSERT IGNORE.
+
+    Why this exists: the simulator builds ChargerState instances in
+    memory and writes their telemetry to charger_telemetry +
+    charger_windows. But assemble_context's Tier 1 profile snapshot
+    reads from charger_registry. Without registration, the profile
+    lookup silently returns nothing — site_id can't be parsed,
+    Tier 5 (fleet_memory) is skipped entirely, and the routing
+    layer's shortcut path can never fire because top_fleet_match
+    stays None.
+
+    Empirically discovered after a 0% shortcut rate on a fresh
+    cluster: telemetry existed for CP-IE-TEST-* chargers, but the
+    registry was populated from seed_charger_registry.py (which
+    generates CP-IE-DUB-*, CP-IE-CORK-*, etc.) and never carried
+    the test-fixture charger IDs. Backfilling the registry restored
+    Tier 5; this function prevents the gap from recurring.
+    """
+    if not fleet.chargers:
+        return
+
+    today = datetime.now(timezone.utc).date()
+
+    rows = []
+    for c in fleet.chargers:
+        install_date = today - timedelta(days=c.install_days_ago)
+        rows.append((
+            c.charger_id,
+            c.site_id,
+            c.model,
+            c.manufacturer,
+            c.firmware,
+            install_date,
+            53.35,   # placeholder Dublin lat for synthetic chargers
+            -6.26,   # placeholder Dublin lon
+            c.connector_count,
+            c.max_power_w / 1000.0,    # back to kW for registry schema
+            c.environment,
+            install_date,              # last_maintenance == install (fresh fleet)
+            0,                         # total_sessions (synthetic, no history)
+            0,                         # total_energy_kwh
+        ))
+
+    sql = """
+        INSERT IGNORE INTO charger_registry
+            (charger_id, site_id, model, manufacturer, firmware_version,
+             install_date, lat, lon, connector_count, max_power_kw,
+             environment, last_maintenance, total_sessions, total_energy_kwh)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    with db.cursor() as cur:
+        cur.executemany(sql, rows)
+        # rowcount returns rows actually inserted; INSERT IGNORE skips
+        # duplicates so this can be < len(rows) on re-runs.
+        inserted = cur.rowcount or 0
+
+    skipped = len(rows) - inserted
+    print(
+        f"-- charger_registry: registered {inserted} new "
+        f"({skipped} already present) of {len(rows)} fleet chargers",
+        file=sys.stderr,
+    )
+
+
 def _run_direct(fleet: FleetSimulator, args):
     db = _get_direct_db()
+    # Ensure the simulated fleet is in charger_registry before writing
+    # any telemetry — Tier 1 of assemble_context depends on it, and
+    # missing registry rows silently break the routing layer downstream.
+    _register_charger_fleet(db, fleet)
     writer = DirectWriter(db)
 
     sim_time = datetime.now(timezone.utc)

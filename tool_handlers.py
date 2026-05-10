@@ -133,6 +133,14 @@ except Exception:
 TOKEN_BUDGET_DEFAULT = 4000
 TOKEN_SAFETY_MARGIN = 0.10  # 10% buffer
 
+# R1: hard cap on the Tier 5 (fleet_memory) section of assemble_context.
+# Tier 5 used to consume whatever remained of the global budget after
+# Tiers 1-4 — which let the seed inflate as fleet_memory grew. R2
+# (limit=3, 80-char truncation) reduced typical Tier 5 to ~120 tokens.
+# This cap is defense-in-depth: even if those parameters regress later,
+# the seed's fleet_memory section can never exceed TIER5_MAX_TOKENS.
+TIER5_MAX_TOKENS = 500
+
 
 def count_tokens(text: str) -> int:
     if _enc is not None:
@@ -884,13 +892,22 @@ def assemble_context(session_id: str, charger_id: str,
                      token_budget: int = TOKEN_BUDGET_DEFAULT) -> dict:
     """
     Assemble context for Claude's system prompt.
-    
+
     UPGRADE: Uses effective_budget() with 10% safety margin.
+
+    Returns dict including `top_fleet_match`: the highest-similarity
+    fleet_memory entry retrieved by Tier 5, if any. Used by run_agent
+    to route high-confidence pattern matches to the Haiku shortcut
+    path. Distinct from `sources` which lists which memories made it
+    into the seed text — `top_fleet_match` reports what was found,
+    even if truncated out of the seed by the R1/R2 caps.
     """
     t_start = time.monotonic()
     sections = []
     sources = []
     tokens_remaining = effective_budget(token_budget)
+    top_fleet_match: Optional[dict] = None
+    fleet_matches: list[dict] = []
 
     # 1. Charger profile (~80 tokens)
     profile = json.loads(get_charger_context(
@@ -960,6 +977,14 @@ def assemble_context(session_id: str, charger_id: str,
     # 5. Fleet memory — single query with scope ranking.
     # Parse site_id from the Tier 1 profile snapshot we already fetched
     # rather than re-querying charger_registry.
+    #
+    # Graceful degradation: if site_id parsing fails (registry missing,
+    # snapshot text format changed, etc.) we still run Tier 5 against
+    # `scope="any"` rather than skipping the tier entirely. Skipping
+    # silently zeros out the routing layer's top_fleet_match, which
+    # caused a 0% shortcut rate on a fresh cluster despite a populated
+    # fleet_memory. Falling back to "any" preserves cluster recognition
+    # even when the data plane is partially incomplete.
     if tokens_remaining > 100:
         site_id = None
         for snap in profile.get("snapshots", []):
@@ -969,40 +994,90 @@ def assemble_context(session_id: str, charger_id: str,
                 break
 
         if site_id:
-            # Try most specific scope; recall_fleet_memory now handles
-            # IN (scope, 'global') in a single query
+            # Most specific scope: this site's memories OR globals.
             primary_scope = f"site:{site_id}"
-            memories = json.loads(recall_fleet_memory(
-                trigger_text, scope=primary_scope, limit=5
-            ))
-            if "error" in memories:
-                err_msg = _summarize_error(memories["error"])
-                sentinel = f"fleet_memory:ERROR:{err_msg}"
-                sources.append(sentinel)
-                log.warning(
-                    "assemble_context: Tier 5 (recall_fleet_memory) "
-                    "failed for charger %s: %s",
-                    charger_id, memories["error"],
+        else:
+            # Fallback: site unknown, query unconstrained scope. Logged
+            # so it's visible when the data plane is in a degraded
+            # state rather than silently producing thin seeds.
+            primary_scope = "any"
+            sources.append("fleet_memory:WARN:site_id_missing")
+            log.warning(
+                "assemble_context: Tier 5 falling back to scope='any' "
+                "for charger %s — no site_id in profile snapshot. "
+                "Check that charger_registry has this charger.",
+                charger_id,
+            )
+
+        # R2: cap at 3 results (was 5). The seed should function as
+        # a pointer to fleet patterns, not a content dump — the
+        # full memory is one tool call away if the agent needs it.
+        # 5 entries inflated the seed as fleet_memory grew across
+        # investigations; 3 keeps the per-investigation cost
+        # roughly flat against memory size.
+        memories = json.loads(recall_fleet_memory(
+            trigger_text, scope=primary_scope, limit=3
+        ))
+        if "error" in memories:
+            err_msg = _summarize_error(memories["error"])
+            sentinel = f"fleet_memory:ERROR:{err_msg}"
+            sources.append(sentinel)
+            log.warning(
+                "assemble_context: Tier 5 (recall_fleet_memory) "
+                "failed for charger %s: %s",
+                charger_id, memories["error"],
+            )
+        else:
+            # Capture the matches for the routing layer BEFORE
+            # the R1/R2 truncation runs. The seed text may end up
+            # smaller (one line, 80-char content) but routing
+            # decisions need the full match metadata.
+            #
+            # We surface BOTH the top-by-similarity match (for
+            # legacy callers / telemetry) AND the full ordered
+            # list. Routing scans the full list because
+            # top-by-similarity isn't always top-by-confidence:
+            # a generic high-similarity entry can outrank a more
+            # specific high-confidence entry, which would block
+            # shortcut routing despite a confident match being
+            # available in the same response.
+            _all_memories = memories.get("memories", [])
+            if _all_memories:
+                top_fleet_match = _all_memories[0]
+                fleet_matches = _all_memories
+
+            memory_lines = []
+            tier5_used = 0  # R1: independent counter for this section
+            for m in _all_memories:
+                # R2: truncate content to 80 chars (was 150). The
+                # seed advertises that a pattern exists; the agent
+                # can recall_fleet_memory by id for the full text
+                # if a tool call needs it.
+                line = (
+                    f"- [{m['category']}, {m['scope']}] "
+                    f"{m['content'][:80]} "
+                    f"(confidence: {m['confidence']}, "
+                    f"evidence: {m['supporting_evidence_count']}x)"
                 )
-            else:
-                memory_lines = []
-                for m in memories.get("memories", []):
-                    line = (
-                        f"- [{m['category']}, {m['scope']}] "
-                        f"{m['content'][:150]} "
-                        f"(confidence: {m['confidence']}, "
-                        f"evidence: {m['supporting_evidence_count']}x)"
-                    )
-                    line_tokens = count_tokens(line)
-                    if line_tokens <= tokens_remaining:
-                        memory_lines.append(line)
-                        tokens_remaining -= line_tokens
-                        sources.append(f"fleet_memory:{m['id']}")
-                if memory_lines:
-                    sections.append(
-                        "## Fleet knowledge (relevant to this charger)\n"
-                        + "\n".join(memory_lines)
-                    )
+                line_tokens = count_tokens(line)
+                # R1: gate on BOTH the global remaining budget AND
+                # the Tier 5 hard cap. Either limit terminates the
+                # loop. Order matters for correctness — once the
+                # cap is hit, subsequent (less relevant) entries
+                # are skipped even if global budget would allow them.
+                if (line_tokens <= tokens_remaining
+                        and tier5_used + line_tokens <= TIER5_MAX_TOKENS):
+                    memory_lines.append(line)
+                    tokens_remaining -= line_tokens
+                    tier5_used += line_tokens
+                    sources.append(f"fleet_memory:{m['id']}")
+                else:
+                    break  # respect the cap; don't keep scanning
+            if memory_lines:
+                sections.append(
+                    "## Fleet knowledge (relevant to this charger)\n"
+                    + "\n".join(memory_lines)
+                )
 
     system_context = "\n\n".join(sections)
     tokens_used = effective_budget(token_budget) - tokens_remaining
@@ -1013,6 +1088,8 @@ def assemble_context(session_id: str, charger_id: str,
         "tokens_used": tokens_used,
         "sources": sources,
         "assembly_ms": assembly_ms,
+        "top_fleet_match": top_fleet_match,
+        "fleet_matches": fleet_matches,
     }
 
 
@@ -1434,19 +1511,102 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 
     client = anthropic.Anthropic()
 
-    # Classify the trigger to pick the cheapest viable model.
-    # Simple lookups → Haiku + short loop; investigations → Sonnet + full loop.
-    classification = _classify_trigger(trigger, client, obs)
-    if classification == "lookup":
-        loop_model = HAIKU_MODEL
-        max_tool_rounds = 5
-    else:
-        loop_model = SONNET_MODEL
-        max_tool_rounds = 15
-    log.info(
-        f"Trigger classified as '{classification}' for session {session_id}: "
-        f"model={loop_model}, max_tool_rounds={max_tool_rounds}"
+    # Routing decision. Three paths, evaluated in priority order:
+    #
+    # 1. SHORTCUT — Tier 5 of assemble_context found a high-confidence
+    #    fleet_memory match (confidence >= 0.95 AND similarity >= 0.85).
+    #    The cognitive foundation has already seen this pattern, so we
+    #    skip expensive Sonnet reasoning and route to Haiku for verify-
+    #    and-checkpoint in 3 rounds. Skips the classify call too —
+    #    we already know the answer shape.
+    #
+    # 2. LOOKUP — Haiku classifier reads only the trigger string and
+    #    flags simple status queries ("what's the status of X?") that
+    #    can be answered in 1-2 tool calls. Haiku + 5 rounds.
+    #
+    # 3. EXPLORE — default path. No high-confidence match, not a
+    #    lookup-shape trigger. Sonnet + 15 rounds (the legacy path).
+    SHORTCUT_CONFIDENCE_MIN = 0.85
+    SHORTCUT_SIMILARITY_MIN = 0.55
+
+    # Scan ALL Tier 5 matches, not just the top-by-similarity one.
+    # The most-similar entry isn't always the most-confident — a
+    # generic 0.72-confidence pattern with rich vocabulary overlap
+    # can outrank a charger-specific 0.97-confidence entry in cosine
+    # space. We want shortcut to fire whenever ANY returned match
+    # passes both gates, preferring the highest confidence among
+    # those that do.
+    top_match = ctx.get("top_fleet_match")  # kept for telemetry
+    fleet_matches = ctx.get("fleet_matches") or []
+
+    best_shortcut_match: Optional[dict] = None
+    for m in fleet_matches:
+        try:
+            _conf = float(m.get("confidence", 0))
+            _sim = float(m.get("similarity", 0))
+        except (TypeError, ValueError):
+            continue
+        if _conf < SHORTCUT_CONFIDENCE_MIN:
+            continue
+        if _sim < SHORTCUT_SIMILARITY_MIN:
+            continue
+        if (best_shortcut_match is None
+                or _conf > float(best_shortcut_match.get("confidence", 0))):
+            best_shortcut_match = m
+
+    # Print routing inputs directly to stderr. log.info goes to a
+    # logger that has no handler attached when dispatch.py runs and
+    # gets silently dropped at default WARNING level, so we bypass
+    # Python logging here for guaranteed visibility. Tagged [ROUTING]
+    # so it's grep-friendly.
+    import sys as _sys_routing
+    _top_str = (
+        f"id={top_match.get('id')}"
+        f"/conf={top_match.get('confidence')}"
+        f"/sim={top_match.get('similarity')}"
+        if top_match else "None"
     )
+    _eligible_str = (
+        f"id={best_shortcut_match.get('id')}"
+        f"/conf={best_shortcut_match.get('confidence')}"
+        f"/sim={best_shortcut_match.get('similarity')}"
+        if best_shortcut_match else "none"
+    )
+    _sys_routing.stderr.write(
+        f"[ROUTING] session={session_id} matches={len(fleet_matches)} "
+        f"top_match={_top_str} eligible={_eligible_str}\n"
+    )
+    _sys_routing.stderr.flush()
+
+    if best_shortcut_match is not None:
+        loop_model = HAIKU_MODEL
+        max_tool_rounds = 3
+        routing_signal = "shortcut"
+        obs.record_routing(routing_signal, best_shortcut_match)
+        log.info(
+            "Routing: SHORTCUT for session %s — fleet_memory id=%s "
+            "confidence=%s similarity=%s; loop_model=%s, max_rounds=%d",
+            session_id, best_shortcut_match.get("id"),
+            best_shortcut_match.get("confidence"),
+            best_shortcut_match.get("similarity"),
+            loop_model, max_tool_rounds,
+        )
+    else:
+        # Fall through to the existing classifier.
+        classification = _classify_trigger(trigger, client, obs)
+        if classification == "lookup":
+            loop_model = HAIKU_MODEL
+            max_tool_rounds = 5
+            routing_signal = "lookup"
+        else:
+            loop_model = SONNET_MODEL
+            max_tool_rounds = 15
+            routing_signal = "explore"
+        obs.record_routing(routing_signal, top_match)
+        log.info(
+            f"Routing: {routing_signal.upper()} for session {session_id}: "
+            f"model={loop_model}, max_tool_rounds={max_tool_rounds}"
+        )
 
     messages = [{"role": "user", "content": trigger}]
 

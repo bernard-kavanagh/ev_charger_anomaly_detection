@@ -91,6 +91,17 @@ class AgentObserver:
         self.api_cache_read_tokens: int = 0
         self.api_calls_by_role: dict[str, int] = {}
 
+        # Routing decision for this investigation. One of:
+        #   'shortcut' — high-confidence Tier 5 fleet match; loop ran on
+        #                Haiku with reduced max_tool_rounds. Skips classify.
+        #   'explore'  — no high-confidence match; loop ran on Sonnet
+        #                with full max_tool_rounds (the legacy path).
+        #   'lookup'   — classifier flagged the trigger as a simple
+        #                status query; loop ran on Haiku.
+        # None means run_agent didn't reach the routing step.
+        self.routing_signal: Optional[str] = None
+        self.routing_top_match: Optional[dict] = None
+
     def _emit(self, event_type: str, data: dict):
         """Emit a structured log event."""
         entry = {
@@ -209,6 +220,35 @@ class AgentObserver:
             "cache_read_input_tokens": cache_read_input_tokens,
         })
 
+    # --- Routing decision ---
+
+    def record_routing(self, signal: str,
+                       top_match: Optional[dict] = None):
+        """Record the routing decision for this investigation.
+
+        signal: 'shortcut' | 'explore' | 'lookup'.
+
+        top_match: the top fleet_memory match returned by Tier 5
+        of assemble_context, if any. Stored to allow post-hoc
+        analysis of which matches drove which routing decisions.
+        """
+        self.routing_signal = signal
+        self.routing_top_match = top_match
+        data: dict = {"signal": signal}
+        if top_match:
+            # Store only the small, audit-relevant fields. Don't
+            # serialize the full memory content into telemetry.
+            data["top_match_id"] = top_match.get("id")
+            try:
+                data["top_match_confidence"] = float(top_match.get("confidence", 0))
+            except (TypeError, ValueError):
+                data["top_match_confidence"] = None
+            try:
+                data["top_match_similarity"] = float(top_match.get("similarity", 0))
+            except (TypeError, ValueError):
+                data["top_match_similarity"] = None
+        self._emit("routing_decision", data)
+
     # --- Completion ---
 
     def agent_complete(self, response_tokens: int = 0):
@@ -231,6 +271,7 @@ class AgentObserver:
             "api_cache_creation_tokens": self.api_cache_creation_tokens,
             "api_cache_read_tokens": self.api_cache_read_tokens,
             "api_calls_by_role": dict(self.api_calls_by_role),
+            "routing_signal": self.routing_signal,
             "response_tokens": response_tokens,
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
             "avg_vector_distance": (
@@ -259,4 +300,5 @@ class AgentObserver:
             "api_cache_creation_tokens": self.api_cache_creation_tokens,
             "api_cache_read_tokens": self.api_cache_read_tokens,
             "api_calls_by_role": dict(self.api_calls_by_role),
+            "routing_signal": self.routing_signal,
         }

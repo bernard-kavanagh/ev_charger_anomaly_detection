@@ -180,6 +180,7 @@ def print_fleet_summary(
     api_output_tokens: int,
     api_cache_creation_tokens: int,
     api_cache_read_tokens: int,
+    routing_counts: dict[str, int],
 ):
     avg_dur = sum(durations) / len(durations) if durations else 0.0
     min_dur = min(durations) if durations else 0.0
@@ -218,6 +219,30 @@ def print_fleet_summary(
         f"({cache_hit_pct:.1f}% hit rate)",
         file=sys.stderr,
     )
+
+    # Routing breakdown — how many investigations took the shortcut
+    # (high-confidence Tier 5 match) vs explore (Sonnet) vs lookup
+    # (status query). The shortcut count is the headline number for
+    # the cognitive foundation thesis: as fleet_memory accumulates,
+    # this should rise across runs and the avg-tokens-per-charger
+    # number above should fall.
+    if routing_counts:
+        n_shortcut = routing_counts.get("shortcut", 0)
+        n_explore = routing_counts.get("explore", 0)
+        n_lookup = routing_counts.get("lookup", 0)
+        n_unknown = sum(routing_counts.values()) - (n_shortcut + n_explore + n_lookup)
+        shortcut_pct = (100.0 * n_shortcut / total) if total else 0.0
+        routing_str = (
+            f"{n_shortcut} shortcut, {n_explore} explore, {n_lookup} lookup"
+        )
+        if n_unknown:
+            routing_str += f", {n_unknown} unknown"
+        print(
+            f"  Routing:                {routing_str} "
+            f"({shortcut_pct:.0f}% shortcut)",
+            file=sys.stderr,
+        )
+
     print(f"{'═' * _WIDE}", file=sys.stderr)
 
 
@@ -397,6 +422,7 @@ def main():
     api_output_total = 0
     api_cache_create_total = 0
     api_cache_read_total = 0
+    routing_counts: dict[str, int] = {}
 
     for i in range(n):
         result = ordered_results[i]
@@ -415,6 +441,9 @@ def main():
         api_output_total += obs.get("api_output_tokens", 0)
         api_cache_create_total += obs.get("api_cache_creation_tokens", 0)
         api_cache_read_total += obs.get("api_cache_read_tokens", 0)
+        signal = obs.get("routing_signal")
+        if signal:
+            routing_counts[signal] = routing_counts.get(signal, 0) + 1
 
     # ------------------------------------------------------------------
     # Fleet summary
@@ -430,6 +459,7 @@ def main():
         api_output_tokens=api_output_total,
         api_cache_creation_tokens=api_cache_create_total,
         api_cache_read_tokens=api_cache_read_total,
+        routing_counts=routing_counts,
     )
 
 
