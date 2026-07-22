@@ -1,11 +1,26 @@
 -- ============================================================================
--- EV CHARGER IoT PLATFORM — UNIFIED TiDB CLOUD SCHEMA (v2)
--- Single cluster: data plane + context plane
--- Includes: FULLTEXT indexes, anomaly_breakdown, supersession tracking
+-- Schema for cognitive foundation (canonical, as of 2026-07-22)
+-- ----------------------------------------------------------------------------
+-- DATA PLANE     (raw operational data — agent reasons against this)
+--   charger_telemetry, charger_windows, charger_registry, outage_catalog
+--
+-- CONTEXT PLANE  (agent memory — cognitive foundation state)
+--   agent_reasoning, fleet_memory, session_state, context_snapshots
+-- ----------------------------------------------------------------------------
+-- Historical migrations live in migrations/. As of this file, all migrations
+-- have been merged into the CREATE TABLE blocks below. New pre-v3 installs
+-- run schema.sql only; existing v2 installs run migrations/schema_v3_*.sql
+-- once. schema.sql is idempotent (IF NOT EXISTS); the migration files are not.
+--
+-- Includes: FULLTEXT indexes, anomaly_breakdown, supersession tracking (v2);
+--   derived-confidence columns for decision-grade confidence (v3 — see the
+--   per-column comments in fleet_memory and agent_reasoning below).
 -- ============================================================================
 
 -- ============================================================================
--- DATA PLANE: IoT telemetry, Flink windows, outage catalog
+-- DATA PLANE: raw operational data (telemetry, Flink windows, registry,
+--             curated outage catalog) — the raw material the agent reasons
+--             against. The agent never mutates these; it only reads.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS charger_telemetry (
@@ -106,7 +121,11 @@ CREATE TABLE IF NOT EXISTS charger_registry (
 
 
 -- ============================================================================
--- CONTEXT PLANE: Agent reasoning, fleet memory, session state
+-- CONTEXT PLANE: agent memory — the cognitive foundation state that persists
+--                across sessions. Episodic (agent_reasoning), semantic
+--                (fleet_memory), and working/session memory (session_state,
+--                context_snapshots). Maintained by the five custodial duties
+--                and the derived-confidence mechanism.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS agent_reasoning (
@@ -119,6 +138,8 @@ CREATE TABLE IF NOT EXISTS agent_reasoning (
   hypothesis      TEXT,
   evidence_refs   JSON,
   confidence      DECIMAL(3,2)  DEFAULT 0.50,
+  -- v3: model self-report kept as telemetry only (see migrations/schema_v3_derived_confidence.sql)
+  model_confidence DECIMAL(3,2) NULL COMMENT 'Model self-report, telemetry only',
   resolution      ENUM('confirmed','dismissed','escalated','promoted')
                                 NOT NULL,
   resolved_at     TIMESTAMP     NULL,
@@ -126,6 +147,9 @@ CREATE TABLE IF NOT EXISTS agent_reasoning (
   -- v2: contradiction tracking
   superseded_by   BIGINT        NULL COMMENT 'ID of newer reasoning that contradicts this one',
   superseded_at   TIMESTAMP     NULL COMMENT 'When this reasoning was superseded',
+  -- v3: field-tech outcome write-back (verify_outcome handler / agent/verify_outcome.py)
+  verified_outcome ENUM('fixed_as_diagnosed','different_fault','no_fault_found') NULL,
+  verified_at     TIMESTAMP     NULL,
   reasoning_vec   VECTOR(384),
   INDEX idx_charger_reasoning (charger_id, created_at DESC),
   INDEX idx_session          (session_id, created_at),
@@ -144,10 +168,16 @@ CREATE TABLE IF NOT EXISTS fleet_memory (
   scope           VARCHAR(128)  NOT NULL DEFAULT 'global',
   content         TEXT          NOT NULL,
   source_refs     JSON,
-  confidence      DECIMAL(3,2)  DEFAULT 0.70,
+  confidence      DECIMAL(3,2)  DEFAULT 0.70   COMMENT 'v3: platform-DERIVED confidence (Beta-posterior via derive_confidence); never a model-supplied value',
+  -- v3: derived-confidence inputs and telemetry (see migrations/schema_v3_derived_confidence.sql)
+  model_confidence DECIMAL(3,2) NULL          COMMENT 'Model self-report, telemetry only — never used in decisions',
+  provenance ENUM('session','consolidated','verified') NOT NULL DEFAULT 'session',
   supporting_evidence_count INT DEFAULT 1,
+  confirmations   INT           NOT NULL DEFAULT 0,
+  contradictions  INT           NOT NULL DEFAULT 0,
   access_count    INT           DEFAULT 0,
   last_accessed   TIMESTAMP     NULL,
+  last_decayed_at TIMESTAMP     NULL          COMMENT 'v3: dedicated decay clock so confidence decay no longer piggybacks on updated_at',
   status          ENUM('active','deprecated','superseded') DEFAULT 'active',
   superseded_by   BIGINT        NULL,
   memory_vec      VECTOR(384),

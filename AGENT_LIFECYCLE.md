@@ -39,10 +39,13 @@ Every code reference points to a real line in the current tree.
    └──────────────────────────────── │ ─────────────────────────────────┘
                                      │
    ┌──────────────────────────────── ▼ ─────────────────────────────────┐
-   │  STEP 2 — Routing decision  [tool_handlers.py:1500]                │
+   │  STEP 2 — Routing decision  [tool_handlers.py:_shortcut_eligible]  │
    │                                                                    │
-   │   Scan fleet_matches for any entry with                            │
-   │     confidence >= 0.85  AND  similarity >= 0.55                    │
+   │   Scan fleet_matches for any entry clearing ALL of:                │
+   │     derived confidence >= 0.85                                     │
+   │     AND (confirmations >= 3  OR  provenance = 'verified')          │
+   │     AND superseded_by IS NULL                                      │
+   │     AND similarity >= 0.55                                         │
    │                                                                    │
    │     yes → SHORTCUT  Haiku + 3 rounds  (skips classify call)        │
    │     no  → fall through to:                                         │
@@ -93,13 +96,15 @@ Every code reference points to a real line in the current tree.
 
 ## 2. Why each step is shaped this way
 
+> **Post-refactor status (July 2026).** Hybrid search now runs `FTS_MATCH_WORD` filter-and-rank (see commits `1e674c1`, `be75145`), and shortcut routing gates on *derived* confidence with structural clauses (commit `830d054`). The empirical numbers in §4 were measured **before** these changes — cluster-A day-1 shortcut rates in particular were measured against a gate that trusted model self-report. Post-refactor re-measurement is pending. The directional claim (cost reduction via routing) holds; the specific numeric ranges will shift.
+
 ### Tier 5 caps (R2 + R1)
 
 Tier 5 used to consume whatever budget remained after Tiers 1-4, with `limit=5` and 150-char content truncation. This worked for an empty `fleet_memory` table — but as memory grew, the seed inflated proportionally. **Per-investigation cost climbed +54% across a 10-dispatch warm-up** before R2/R1 landed.
 
-R2 (`tool_handlers.py:990`): `limit=3` and `[:80]` content truncation. Treats the seed as a *pointer* to fleet patterns; the agent can `recall_fleet_memory` by id for the full text if it needs more.
+R2 (`tool_handlers.py:assemble_context`, Tier 5 block): `limit=3` and `[:80]` content truncation. Treats the seed as a *pointer* to fleet patterns; the agent can `recall_fleet_memory` by id for the full text if it needs more.
 
-R1 (`tool_handlers.py:142`): `TIER5_MAX_TOKENS = 500` hard cap on the section. Defense-in-depth — the seed's fleet_memory contribution can never exceed 500 tokens regardless of how big the underlying table grows.
+R1 (`tool_handlers.py:TIER5_MAX_TOKENS`, enforced in `assemble_context`): `TIER5_MAX_TOKENS = 500` hard cap on the section. Defense-in-depth — the seed's fleet_memory contribution can never exceed 500 tokens regardless of how big the underlying table grows.
 
 **After R2+R1, mean dropped from 16,251 to 11,706 tokens/charger and the climb went from +54% to −2% (curve flat).**
 
@@ -109,13 +114,13 @@ The original architecture assumed Sonnet would self-shortcut on familiar pattern
 
 The routing layer makes the shortcut **external to the LLM**. Code inspects Tier 5's top matches, and if any passes both gates (confidence ≥ 0.85, similarity ≥ 0.55), routes the entire loop to Haiku with `max_tool_rounds = 3`. The shortcut also skips the classify call entirely — no triage needed when the cognitive foundation has already recognized the pattern.
 
-`tool_handlers.py:1500-1580` — full implementation.
+`tool_handlers.py:run_agent` (routing decision) + `tool_handlers.py:_shortcut_eligible` (the gate) — full implementation.
 
 ### Tier 5 graceful degradation
 
 Originally, if `site_id` parsing failed for any reason (registry missing the charger, snapshot text format changed), the entire Tier 5 block was skipped. Silently. This zeroed out `top_fleet_match` and blocked the routing layer.
 
-`tool_handlers.py:980` — when `site_id` is missing, fall back to `scope="any"` instead of skipping. Tagged in `sources` as `fleet_memory:WARN:site_id_missing` so degraded state is visible.
+`tool_handlers.py:assemble_context` (Tier 5 block) — when `site_id` is missing, fall back to `scope="any"` instead of skipping. Tagged in `sources` as `fleet_memory:WARN:site_id_missing` so degraded state is visible.
 
 This was the root cause of a 0% shortcut rate on a fresh cluster despite a populated `fleet_memory` — the registry didn't have the test fixture chargers.
 
@@ -133,7 +138,7 @@ The summary call used to send the entire `messages` array (the loop's full conve
 
 ### System prompt caching
 
-`tool_handlers.py:1497` — the loop's system prompt is byte-identical across all iterations of one investigation. Render order is `tools → system → messages`; a `cache_control` marker on the system block caches both tools and system together.
+`tool_handlers.py:run_agent` (system block, `cache_control: ephemeral`) — the loop's system prompt is byte-identical across all iterations of one investigation. Render order is `tools → system → messages`; a `cache_control` marker on the system block caches both tools and system together.
 
 Iteration 1 pays 1.25× (write); iterations 2-N read at 0.1×. Across a typical 5-iteration loop, this cuts system input tokens by ~70%.
 
@@ -308,12 +313,12 @@ Anchor points for someone implementing or auditing this:
 | Concern | File:lines |
 |---|---|
 | Context assembly (5 tiers, 4000-token cap) | `tool_handlers.py:assemble_context` |
-| Tier 5 cap (R1) + content truncation (R2) | `tool_handlers.py:142, 990-1080` |
-| Tier 5 graceful degradation | `tool_handlers.py:980-1010` |
-| Routing decision | `tool_handlers.py:1500-1580` |
-| System prompt caching | `tool_handlers.py:1497` (`cache_control: ephemeral`) |
+| Tier 5 cap (R1) + content truncation (R2) | `tool_handlers.py:TIER5_MAX_TOKENS`, enforced in `assemble_context` |
+| Tier 5 graceful degradation | `tool_handlers.py:assemble_context` (Tier 5 block) |
+| Routing decision | `tool_handlers.py:run_agent`, `_shortcut_eligible` |
+| System prompt caching | `tool_handlers.py:run_agent` (`cache_control: ephemeral`) |
 | Slim summary call | `tool_handlers.py` summary section |
-| AgentObserver routing tracking | `observability.py:94-103, 213-240` |
+| AgentObserver routing tracking | `observability.py:AgentObserver.record_routing` |
 | Dispatch fleet summary (with routing) | `agent/dispatch.py:print_fleet_summary` |
 | Registry write-on-create | `seed/stream_telemetry.py:_register_charger_fleet` |
 | Three-tier memory schema | `schema.sql` (`agent_reasoning`, `fleet_memory`, `context_snapshots`) |
@@ -348,5 +353,7 @@ These reframes don't weaken the case. They strengthen it — they survive contac
   - Per-future timeout in `dispatch.py` to prevent one stuck thread blocking a 10-dispatch loop
   - Schema-mismatch retries on `write_reasoning_checkpoint` (agent occasionally calls without `observation`); `_safe_handler` catches and surfaces a retryable error, agent self-corrects on next turn
   - Richer routing telemetry (per-model token breakdown in dispatch summary)
+  - `verify_outcome` write-back path exists, but no field-tech workflow yet routes real outcomes through it — the ground-truth loop is wired but not yet fed.
+  - Integration-test discipline established (July 2026): SQL-shape changes must exercise a live TiDB cluster via `RUN_INTEGRATION=1 pytest` before push. Precedent: commits `1e674c1` and `be75145`.
 
 The architecture works. The thesis is reframed but defensible. The numbers are measured, not estimated, and validated on two independent clusters.

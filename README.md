@@ -4,6 +4,8 @@ Single-cluster TiDB Cloud architecture for streaming IoT telemetry from 20,000 O
 
 This platform implements the **cognitive foundation** architecture — a three-tier memory structure (episodic, semantic, procedural) with five custodial duties, running on a unified data substrate. It solves the **Memory Wall**: the infrastructure problem caused by stateless models on fragmented stacks.
 
+**v4 (July 2026):** Derived-confidence refactor (kills the self-report anti-pattern), `FTS_MATCH_WORD` hybrid search, outcome write-back via `verify_outcome`, and live-integration test discipline. See [CHANGELOG.md](CHANGELOG.md).
+
 **v3 (May 2026):** Routing layer (Haiku shortcut path), Tier 5 graceful degradation, hard token caps on seed assembly, slim summary call, system prompt caching, charger registry write-on-create. See [AGENT_LIFECYCLE.md](AGENT_LIFECYCLE.md) for the full agent flow, empirical results from a multi-cluster experiment, and the reframed cost/quality thesis.
 
 **v2 (April 2026):** Hybrid search, contradiction resolution, fleet memory compaction, anomaly explainability, data validation, structured observability, and 36 unit tests. See [UPGRADE.md](UPGRADE.md) for the full changelog.
@@ -14,7 +16,7 @@ The cognitive foundation provides four measurable benefits:
 
 1. **Persistent fleet awareness** — cluster recognition, recurrence detection, and cross-charger evidence chains that stateless agents cannot produce. Universal across all cluster states tested.
 2. **Higher-confidence diagnoses** — warm investigations run at 0.93–0.99 confidence vs 0.72–0.78 cold. Same model, same telemetry, stronger conclusions when validating priors are available.
-3. **~75% dollar-cost reduction** at steady state, via routing high-confidence pattern matches to a Haiku shortcut path. Mechanism: model substitution (Sonnet → Haiku), not pure token reduction.
+3. **~75% dollar-cost reduction** at steady state, via routing high-confidence pattern matches to a Haiku shortcut path. Mechanism: model substitution (Sonnet → Haiku), not pure token reduction. As of v4 the shortcut gate is *structural* (derived confidence plus corroboration/supersession clauses — evidence-based), not confidence-only, so a match earns the cheap path through real evidence rather than a self-reported number.
 4. **~40% wall-clock latency reduction** on the shortcut path. Operator-facing.
 
 Token reductions vary by fleet state (~31% on 3-week production fleets, ~57% on smaller warmed clusters). The dollar saving is dominated by the model swap and holds across all states tested. Cold clusters need a 15-25 dispatch warm-up before shortcuts fire reliably; production clusters with accumulated memory route 100% shortcut from the first dispatch.
@@ -105,6 +107,8 @@ pip install -r requirements.txt
 | `kafka-python` | Kafka consumer — production TiCDC mode only (commented out by default) |
 | `pyflink` | Flink windowing job — production only (commented out by default) |
 
+> **Note:** the first install pulls `torch` (~800MB) transitively via `sentence-transformers`. Budget install time (and disk) accordingly.
+
 ---
 
 ## Quick Start
@@ -135,6 +139,8 @@ mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u "$TIDB_USER" -p"$TIDB_PASSWORD" \
   --ssl-ca="$TIDB_SSL_CA" "$TIDB_DATABASE" < schema.sql
 ```
 
+As of v4, the v3 derived-confidence columns from `migrations/schema_v3_derived_confidence.sql` are consolidated directly into `schema.sql`. **Fresh installs** run `schema.sql` only and are current. **Existing pre-v3 installs** run the migration once (`schema.sql` is idempotent via `IF NOT EXISTS`; the migration file is not).
+
 ### 3. Seed reference data
 
 ```bash
@@ -151,7 +157,7 @@ python3 seed/seed_outage_catalog.py
 
 ```bash
 python -m pytest tests/ -v
-# Expected: 36 passed
+# Expected: 76 passed (3 integration tests skipped unless RUN_INTEGRATION=1)
 ```
 
 ### 5. Generate telemetry and embed
@@ -249,7 +255,10 @@ ev-charger-platform/
 ├── text_bander.py                # Shared semantic banding module (v2)
 ├── validation.py                 # Data quality checks (v2)
 ├── observability.py              # Structured JSON logging via AgentObserver (v2)
-├── UPGRADE.md                    # v2 changelog
+├── CHANGELOG.md                  # Version history (v1 → v4)
+├── UPGRADE.md                    # v2 audit-upgrade detail (linked from CHANGELOG)
+├── migrations/
+│   └── schema_v3_derived_confidence.sql  # v3 migration (consolidated into schema.sql; kept as historical record)
 ├── check-upgrade.md              # Claude CLI audit prompt
 ├── seed/
 │   ├── seed_charger_registry.py  # Generate 20,000 charger records
@@ -260,14 +269,16 @@ ev-charger-platform/
 ├── agent/
 │   ├── __init__.py               # Package marker
 │   ├── run_agent.py              # Single-agent CLI
-│   └── dispatch.py               # Multi-agent concurrent dispatcher
+│   ├── dispatch.py               # Multi-agent concurrent dispatcher
+│   └── verify_outcome.py         # Field-tech outcome write-back CLI (v4)
 ├── flink/
 │   └── flink_windowing_job.py    # PyFlink job (optional, for production)
 ├── config/
 │   └── ticdc_config.toml         # TiCDC changefeed config (Essentials/Dedicated)
 └── tests/
     ├── __init__.py               # Test package marker
-    └── test_tool_handlers.py     # 36 unit tests (v2)
+    ├── test_tool_handlers.py     # 76 unit tests across 13 classes
+    └── test_integration_hybrid.py # 3 live-TiDB integration tests (RUN_INTEGRATION=1)
 ```
 
 ---
@@ -314,6 +325,8 @@ All vector columns: `VECTOR(384)`, HNSW cosine index.
 | `get_session_state` | Read current session investigation state |
 | `update_session_state` | Write updated focus chargers and summary |
 
+A tenth handler, `verify_outcome`, exists but is deliberately **not** in this list — outcome write-back is field-tech-driven, not agent-driven, to prevent the model from verifying its own diagnoses.
+
 ### Agent lifecycle and empirical results
 
 For the full agent flow (trigger → context assembly → routing decision → loop → summary), the empirical validation across two clusters, and the reframed cost/quality thesis, see [AGENT_LIFECYCLE.md](AGENT_LIFECYCLE.md). It anchors every claim in this README to actual measured dispatch data.
@@ -344,7 +357,7 @@ After context assembly, code (not the model) inspects the top fleet memory match
 
 | Path | Trigger | Model | Tool rounds | Use case |
 |---|---|---|---:|---|
-| **SHORTCUT** | Any fleet match passes `confidence ≥ 0.85` AND `similarity ≥ 0.55` | Haiku | 3 | High-confidence pattern match — verify and checkpoint |
+| **SHORTCUT** | Any fleet match passes `confidence ≥ 0.85` AND (`confirmations ≥ 3` OR `provenance = 'verified'`) AND `superseded_by IS NULL` AND `similarity ≥ 0.55` | Haiku | 3 | High-confidence, corroborated pattern match — verify and checkpoint |
 | **LOOKUP** | Trigger classifier flags status query | Haiku | 5 | Simple status/profile queries |
 | **EXPLORE** | Default — no high-confidence match | Sonnet | 15 | Novel pattern discovery |
 
@@ -359,17 +372,21 @@ See `tool_handlers.py:run_agent` for implementation, `AGENT_LIFECYCLE.md` for em
 1. **Write control:** Agent writes a reasoning checkpoint only when it reaches a conclusion (confirmed/dismissed/escalated). Intermediate reasoning stays ephemeral.
 2. **Deduplication:** `write_fleet_memory()` checks cosine distance < 0.15 before insert. Near-duplicates are merged, incrementing `supporting_evidence_count`.
 3. **Contradiction resolution:** Distance 0.15–0.40 in the same category and scope triggers auto-supersession via `superseded_by`. Prior diagnoses for the same charger are linked.
-4. **Confidence decay:** `cleanup_job()` applies `confidence *= 0.95` monthly for memories older than 30 days. Memories below 0.30 are auto-deprecated.
+4. **Confidence decay:** `cleanup_job()` decays the *derived* confidence of unreinforced memories on a monthly cadence, gated on `last_decayed_at` (a dedicated decay clock) rather than `updated_at` — so routine access-count writes no longer reset the clock. Memories below 0.30 are auto-deprecated.
 5. **Compaction:** `compaction_job()` weekly re-clusters fleet memories, merging entries that have drifted within cosine distance 0.20.
 6. **Forgetting:** TTL policies cap storage at ~960M rows. 90-day zero-access deprecation. Expired context snapshots pruned automatically.
 
-The platform maintains memory through **five custodial duties**: write control (outcomes only), deduplication (cosine < 0.15), reconciliation (`superseded_by` chains), confidence decay (5% monthly, auto-deprecated below 0.30), and compaction (weekly re-clustering). These are SQL operations inside the cluster — not LLM calls, not external services.
+The platform maintains memory through **five custodial duties**: write control (outcomes only), deduplication (cosine < 0.15), reconciliation (`superseded_by` chains), confidence decay (monthly, auto-deprecated below 0.30), and compaction (weekly re-clustering). These are SQL operations inside the cluster — not LLM calls, not external services.
+
+**Derived Confidence (separate mechanism).** As of v4, the `confidence` value the custodial duties decay is no longer a model self-report — it is *derived* by `derive_confidence(provenance, confirmations, contradictions)`, a pure Beta-posterior over observed corroboration (priors: `session` 0.50, `consolidated` 0.75, `verified` ~0.86; clamped to `[0.05, 0.99]`, never 1.0). This is not a sixth duty — it is the computation that produces the value the duties maintain. The model's raw self-report is quarantined in a telemetry-only `model_confidence` column and is never read by any decision path.
 
 > **Time-scale note:** The custodial duties operate at human time-scales (monthly decay, weekly compaction). They cap the *long-term equilibrium* size of `fleet_memory`, not per-investigation cost during a single dispatch loop. Per-investigation cost is governed by the R1+R2 caps on Tier 5 (read-side, immediate) and the routing layer (model selection). The duties keep the underlying store healthy; the routing layer makes investigations cheap.
 
 ### Hybrid search
 
-`_hybrid_search()` combines vector cosine distance with FULLTEXT keyword matching in a single query. `_extract_keywords()` identifies fault codes (E-001, GroundFailure), model names (Terra 54), firmware versions (3.1.2), and environment types. Falls back to vector-only if FULLTEXT indexes aren't present.
+`_hybrid_search()` uses a *filter-and-rank* shape on TiDB `FTS_MATCH_WORD`, not a score blend. `FTS_MATCH_WORD` appears **bare** (never wrapped in another expression) in both `WHERE` and `SELECT`, against a **single full-text column per call** — TiDB forbids nesting it and forbids multiple full-text columns in one query. The keyword predicate in `WHERE` filters; vector cosine distance is the sole `ORDER BY` ranker. `_extract_keywords()` identifies fault codes (E-001, GroundFailure), model names (Terra 54), firmware versions (3.1.2), and environment types.
+
+On a **SQL error** (e.g. a missing FULLTEXT index) the code falls back to vector-only and logs a grep-able `FULLTEXT_FALLBACK` warning. An **empty result from a valid query is a legitimate zero-match answer, not a fallback trigger** — falling back on empty would silently discard the keyword filter the caller asked for.
 
 ### Anomaly explainability
 
@@ -425,14 +442,18 @@ See `UPGRADE.md` for the full changelog.
 
 ## TiDB Cloud Tier Guide
 
-| Feature | Starter | Essentials | Premium |
-|---|---|---|---|
-| Vector search (`VECTOR`, HNSW) | Yes | Yes | Yes |
-| FULLTEXT indexes (hybrid search) | Yes | Yes | Yes |
-| TiCDC changefeeds | No | Yes | Yes |
-| Kafka sink | No | Yes | Yes |
-| TTL policies | Yes | Yes | Yes |
-| Recommended embedding mode | `--poll` | TiCDC + Kafka | TiCDC + Kafka |
+Per the TiDB Cloud features page (July 2026), vector and full-text search are **not** yet universal across Cloud tiers — this is the single most common POC blocker:
+
+| Feature | Starter | Essential | Premium | Dedicated | Self-managed v8.4+ |
+|---|---|---|---|---|---|
+| Vector search (`VECTOR`, HNSW) | ✅ (public preview) | ❌ | ❌ | ❌ | ✅ (native) |
+| Full-text search (hybrid search) | ✅ | ❌ | 🚧 (under development) | ❌ | ✅ (native) |
+| TiCDC changefeeds | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Kafka sink | ❌ | ✅ | ✅ | ✅ | ✅ |
+| TTL policies | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Recommended embedding mode | `--poll` | TiCDC + Kafka | TiCDC + Kafka | TiCDC + Kafka | either |
+
+> **POC footnote:** Because vector storage/search is currently Starter-only (public preview) among Cloud tiers, a POC that needs both vector search *and* TiCDC/Kafka ingestion cannot run on a single stock Cloud tier today. Options: run on **self-managed TiDB v8.4+** (both features native), or keep ingestion on a Cloud tier and compute **app-side cosine similarity** instead of relying on the `VECTOR` index. Re-check the features page before finalizing a tier — preview status moves.
 
 ---
 
@@ -442,15 +463,22 @@ See `UPGRADE.md` for the full changelog.
 python -m pytest tests/ -v
 ```
 
-36 tests across 7 classes:
+76 tests across 13 classes, plus 3 integration tests:
 
 | Class | Tests | Covers |
 |---|---|---|
 | `TestTiDBEncoder` | 3 | Decimal/datetime JSON serialisation |
 | `TestTokenBudget` | 4 | Safety margin (10%), token counting |
 | `TestKeywordExtraction` | 6 | Hybrid search keyword extraction |
+| `TestHybridSearchSQL` | 14 | `FTS_MATCH_WORD` filter-and-rank SQL shape (bare in WHERE + SELECT, single column) |
+| `TestHybridSearchFallback` | 4 | Vector-only fallback on SQL error; no fallback on empty result |
+| `TestDeriveConfidence` | 9 | Beta-posterior priors, monotonicity, `[0.05, 0.99]` clamp |
+| `TestRatchetRemoved` | 1 | Confidence is derived, not a monotonic ratchet on self-report |
+| `TestShortcutEligible` | 7 | Structural shortcut gate (confidence + confirmations/provenance + supersession + similarity) |
+| `TestVerifyOutcomeValidation` | 2 | `verify_outcome` outcome-enum validation |
 | `TestTextBanding` | 9 | All banding functions (power, voltage, temp, leak, fan, errors, status) |
 | `TestAnomalyBreakdown` | 5 | Per-feature scoring, breakdown explainability |
 | `TestValidation` | 9 | Telemetry and window validation edge cases |
+| `TestSummaryPromptBudget` | 3 | Summary-call prompt budget guard |
 
-No live database connection required.
+Unit tests need no live database connection. Integration tests hit a live TiDB cluster and are gated on `RUN_INTEGRATION=1` — see `tests/test_integration_hybrid.py`.
