@@ -385,6 +385,60 @@ def _extract_keywords(text: str) -> list[str]:
 
 
 # ============================================================================
+# DERIVED CONFIDENCE
+# ============================================================================
+#
+# Decision-grade confidence is computed HERE, from observable events, and is
+# never taken from the model's self-report. The model's self-assessment is
+# stored in fleet_memory.model_confidence / agent_reasoning.model_confidence
+# as telemetry only. See migrations/schema_v3_derived_confidence.sql.
+
+# (alpha, beta) Beta priors per provenance — the base rate before evidence.
+_CONFIDENCE_PRIORS = {
+    "session": (1, 1),       # base 0.50 — unverified model self-report
+    "consolidated": (3, 1),  # base 0.75 — corroborated across >=3 cases
+    "verified": (6, 1),      # base ~0.86 — field-verified outcome
+}
+_CONFIDENCE_FLOOR = 0.05
+_CONFIDENCE_CEIL = 0.99
+
+
+def derive_confidence(provenance: str, confirmations: int,
+                      contradictions: int) -> float:
+    """Derive decision-grade confidence from observed outcomes.
+
+    Beta-posterior mean with provenance-dependent priors:
+
+        (confirmations + alpha) / (confirmations + contradictions + alpha + beta)
+
+    Priors (alpha, beta) encode the base rate before any evidence:
+        session      -> (1, 1)  base 0.50  (unverified model self-report)
+        consolidated -> (3, 1)  base 0.75  (corroborated across >=3 cases)
+        verified     -> (6, 1)  base ~0.86 (field-verified outcome)
+
+    Properties:
+      * Monotonically INCREASING in ``confirmations``.
+      * Monotonically DECREASING in ``contradictions``.
+      * DIMINISHING RETURNS: each additional confirmation moves the
+        posterior less than the previous one (Δ from 3→4 < Δ from 0→1).
+      * BOUNDED below 1.0: clamped to [0.05, 0.99] after the posterior is
+        computed, so no amount of corroboration ever yields certainty.
+
+    Pure function: no DB access, no model self-report as input. Unknown
+    provenance falls back to the ``session`` prior.
+    """
+    alpha, beta = _CONFIDENCE_PRIORS.get(provenance, _CONFIDENCE_PRIORS["session"])
+    confirmations = max(0, int(confirmations))
+    contradictions = max(0, int(contradictions))
+    posterior = (confirmations + alpha) / (
+        confirmations + contradictions + alpha + beta
+    )
+    # Clamp BEFORE rounding so a posterior like 0.998 becomes 0.99, never 1.0.
+    clamped = min(_CONFIDENCE_CEIL, max(_CONFIDENCE_FLOOR, posterior))
+    return round(clamped, 2)
+
+
+# ============================================================================
 # TOOL HANDLERS
 # ============================================================================
 
@@ -511,18 +565,23 @@ def write_reasoning_checkpoint(session_id: str, charger_id: str,
     """Write a reasoning checkpoint to agent_reasoning.
     If this contradicts a prior diagnosis for the same charger, mark
     the prior one as superseded."""
+    # The model's self-reported `confidence` is telemetry only: it lands in
+    # model_confidence, while the decision-grade `confidence` column is
+    # derived by the platform. A brand-new checkpoint has no corroboration
+    # yet, so it starts at the session base rate.
+    derived_confidence = derive_confidence("session", 0, 0)
     with get_db() as db:
         with db.cursor() as cur:
             # Insert the new reasoning
             cur.execute("""
                 INSERT INTO agent_reasoning
                     (charger_id, site_id, session_id, observation, hypothesis,
-                     evidence_refs, confidence, resolution, tags)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     evidence_refs, confidence, model_confidence, resolution, tags)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 charger_id, site_id, session_id, observation, hypothesis,
                 json.dumps(evidence_refs or []),
-                confidence, resolution,
+                derived_confidence, confidence, resolution,
                 json.dumps(tags or []),
             ))
             new_id = cur.lastrowid
@@ -622,11 +681,21 @@ def recall_fleet_memory(query_text: str,
 @_safe_handler
 def write_fleet_memory(category: str, scope: str, content: str,
                        source_refs: Optional[list] = None,
-                       confidence: float = 0.7) -> str:
+                       confidence: float = 0.7,
+                       provenance: str = "session",
+                       confirmations: int = 0) -> str:
     """Write or merge a fleet memory record.
-    
+
     UPGRADE: Now checks for semantic contradictions within the same scope
     and auto-supersedes conflicting memories using the superseded_by column.
+
+    Confidence handling: the model-supplied `confidence` is stored into
+    model_confidence as telemetry only. The decision-grade `confidence`
+    column is DERIVED via derive_confidence() from provenance +
+    confirmation/contradiction counters. `provenance`/`confirmations` are
+    internal knobs (e.g. consolidation writes 'consolidated' with
+    confirmations=len(group)); the agent-facing tool never sets them and
+    gets the 'session'/0 defaults.
     """
     vec = embed(content)
 
@@ -634,6 +703,7 @@ def write_fleet_memory(category: str, scope: str, content: str,
     with get_db() as db, db.cursor() as cur:
         cur.execute("""
             SELECT id, content, confidence, category,
+                   provenance, confirmations, contradictions,
                    VEC_COSINE_DISTANCE(memory_vec, %s) AS distance
             FROM fleet_memory
             WHERE status = 'active' AND scope = %s
@@ -643,52 +713,80 @@ def write_fleet_memory(category: str, scope: str, content: str,
         nearby = cur.fetchall()
 
     # Case 1: near-duplicate merge — single UPDATE, atomic under autocommit.
+    # A merge is a corroboration event: bump confirmations and RE-DERIVE
+    # confidence from the counters. The old max-with-self-report ratchet
+    # let a single overconfident self-report permanently raise the score;
+    # derive_confidence() only rises with real corroboration and never 1.0.
     if nearby and float(nearby[0]["distance"]) < 0.15:
         closest = nearby[0]
+        new_confidence = derive_confidence(
+            closest["provenance"],
+            int(closest["confirmations"]) + 1,
+            int(closest["contradictions"]),
+        )
         with get_db() as db, db.cursor() as cur:
             cur.execute("""
                 UPDATE fleet_memory
                 SET content = %s,
-                    confidence = GREATEST(confidence, %s),
+                    confirmations = confirmations + 1,
+                    confidence = %s,
                     supporting_evidence_count = supporting_evidence_count + 1,
                     source_refs = JSON_ARRAY_APPEND(
                         COALESCE(source_refs, JSON_ARRAY()), '$', %s
                     ),
                     memory_vec = %s
                 WHERE id = %s
-            """, (content, confidence,
+            """, (content, new_confidence,
                   json.dumps(source_refs or []),
                   str(vec), closest["id"]))
         return to_json({
             "status": "updated_existing",
             "memory_id": closest["id"],
+            "confidence": new_confidence,
             "message": "Near-duplicate found. Merged with existing memory.",
         })
 
     # Case 2: insert new memory; if it contradicts a prior one, supersede
     # in the same transaction so concurrent readers never see an
     # in-between state and a crash mid-flight rolls back cleanly.
+    # Decision-grade confidence is derived; the model self-report rides
+    # along in model_confidence as telemetry only.
+    derived_confidence = derive_confidence(provenance, confirmations, 0)
     db_conn = _get_pool().connection()
     try:
         db_conn.begin()
         with db_conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO fleet_memory
-                    (category, scope, content, source_refs, confidence, memory_vec)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (category, scope, content, source_refs, confidence,
+                     model_confidence, provenance, confirmations,
+                     contradictions, memory_vec)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, %s)
             """, (category, scope, content,
                   json.dumps(source_refs or []),
-                  confidence, str(vec)))
+                  derived_confidence, confidence, provenance, confirmations,
+                  str(vec)))
             memory_id = cur.lastrowid
 
             if (nearby
                     and float(nearby[0]["distance"]) < 0.4
                     and nearby[0]["category"] == category):
+                # The prior memory is contradicted by this new one: record a
+                # contradiction and re-derive its confidence in the same
+                # transaction that supersedes it.
+                superseded = nearby[0]
+                superseded_confidence = derive_confidence(
+                    superseded["provenance"],
+                    int(superseded["confirmations"]),
+                    int(superseded["contradictions"]) + 1,
+                )
                 cur.execute("""
                     UPDATE fleet_memory
-                    SET status = 'superseded', superseded_by = %s
+                    SET status = 'superseded', superseded_by = %s,
+                        contradictions = contradictions + 1,
+                        confidence = %s
                     WHERE id = %s
-                """, (memory_id, nearby[0]["id"]))
+                """, (memory_id, superseded_confidence, superseded["id"]))
         db_conn.commit()
     except Exception:
         db_conn.rollback()
@@ -699,7 +797,119 @@ def write_fleet_memory(category: str, scope: str, content: str,
     return to_json({
         "status": "created",
         "memory_id": memory_id,
+        "confidence": derived_confidence,
         "message": f"Fleet memory recorded (scope: {scope}).",
+    })
+
+
+# Valid real-world outcomes for a verified diagnosis (mirrors the
+# agent_reasoning.verified_outcome enum in schema v3).
+_VERIFY_OUTCOMES = frozenset({
+    "fixed_as_diagnosed", "different_fault", "no_fault_found",
+})
+
+
+@_safe_handler
+def verify_outcome(reasoning_id: int, outcome: str,
+                   notes: Optional[str] = None) -> str:
+    """Record the field-verified real-world outcome of a diagnosis and
+    propagate corroboration/contradiction into DERIVED confidence.
+
+    This is the ground-truth signal the whole derived-confidence design
+    hinges on. It is DELIBERATELY NOT registered in TOOL_HANDLERS and NOT
+    present in tool_definitions.json: the agent must never verify its own
+    outcomes — that would recreate exactly the self-report loop this
+    refactor removes. Outcomes arrive from a human field tech via
+    agent/verify_outcome.py.
+
+    Effects (single transaction):
+      * agent_reasoning[reasoning_id].verified_outcome / verified_at set.
+      * Every ACTIVE fleet_memory whose source_refs contains
+        "agent_reasoning:{reasoning_id}":
+          - fixed_as_diagnosed  -> confirmations += 1, and provenance
+            promoted session -> verified
+          - different_fault / no_fault_found -> contradictions += 1
+        then confidence re-derived via derive_confidence().
+    """
+    if outcome not in _VERIFY_OUTCOMES:
+        # Validate before any DB access.
+        return to_json({
+            "error": f"Invalid outcome {outcome!r}. Must be one of: "
+                     f"{sorted(_VERIFY_OUTCOMES)}.",
+            "tool": "verify_outcome",
+            "retryable": False,
+        })
+
+    is_confirmation = outcome == "fixed_as_diagnosed"
+    ref = f"agent_reasoning:{reasoning_id}"
+
+    db_conn = _get_pool().connection()
+    try:
+        db_conn.begin()
+        with db_conn.cursor() as cur:
+            cur.execute("""
+                UPDATE agent_reasoning
+                SET verified_outcome = %s, verified_at = NOW()
+                WHERE id = %s
+            """, (outcome, reasoning_id))
+            if cur.rowcount == 0:
+                db_conn.rollback()
+                return to_json({
+                    "error": f"No agent_reasoning row with id {reasoning_id}.",
+                    "tool": "verify_outcome",
+                    "retryable": False,
+                })
+
+            # Fleet memories built from this reasoning chain.
+            cur.execute("""
+                SELECT id, provenance, confirmations, contradictions
+                FROM fleet_memory
+                WHERE status = 'active'
+                  AND JSON_CONTAINS(source_refs, %s)
+            """, (json.dumps(ref),))
+            touched = cur.fetchall()
+
+            updated = []
+            for row in touched:
+                confirmations = int(row["confirmations"])
+                contradictions = int(row["contradictions"])
+                provenance = row["provenance"]
+                if is_confirmation:
+                    confirmations += 1
+                    if provenance == "session":
+                        provenance = "verified"
+                else:
+                    contradictions += 1
+                new_confidence = derive_confidence(
+                    provenance, confirmations, contradictions
+                )
+                cur.execute("""
+                    UPDATE fleet_memory
+                    SET confirmations = %s, contradictions = %s,
+                        provenance = %s, confidence = %s
+                    WHERE id = %s
+                """, (confirmations, contradictions, provenance,
+                      new_confidence, row["id"]))
+                updated.append({
+                    "memory_id": row["id"],
+                    "confidence": new_confidence,
+                    "provenance": provenance,
+                    "confirmations": confirmations,
+                    "contradictions": contradictions,
+                })
+        db_conn.commit()
+    except Exception:
+        db_conn.rollback()
+        raise
+    finally:
+        db_conn.close()
+
+    return to_json({
+        "status": "ok",
+        "reasoning_id": reasoning_id,
+        "outcome": outcome,
+        "notes": notes,
+        "touched_memories": updated,
     })
 
 
@@ -1293,10 +1503,13 @@ def consolidation_job():
                 else:
                     scope = "global"
 
+                # Confidence is NOT hardcoded: it falls out of
+                # derive_confidence('consolidated', len(group), 0). A group
+                # of N confirmed cases IS the corroboration.
                 write_fleet_memory(
                     category="pattern", scope=scope, content=content,
                     source_refs=[f"agent_reasoning:{g['id']}" for g in group],
-                    confidence=0.8,
+                    provenance="consolidated", confirmations=len(group),
                 )
                 ids = [g["id"] for g in group]
                 placeholders = ",".join(["%s"] * len(ids))
@@ -1343,12 +1556,20 @@ def cleanup_job():
         """)
         memories_deprecated = cur.rowcount
 
-        # Confidence decay: 5% reduction per month for memories > 30 days old
+        # Confidence decay: 5% reduction per month. Gate on last_decayed_at,
+        # NOT updated_at — access-count writes bump updated_at, which silently
+        # blocked decay for hot memories. A NULL clock means never decayed, so
+        # fall back to created_at for the first decay.
         cur.execute("""
             UPDATE fleet_memory
-            SET confidence = ROUND(confidence * 0.95, 2)
+            SET confidence = ROUND(confidence * 0.95, 2),
+                last_decayed_at = NOW()
             WHERE status = 'active'
-              AND updated_at < NOW() - INTERVAL 30 DAY
+              AND (
+                    (last_decayed_at IS NULL
+                     AND created_at < NOW() - INTERVAL 30 DAY)
+                 OR last_decayed_at < NOW() - INTERVAL 30 DAY
+              )
         """)
         memories_decayed = cur.rowcount
 
@@ -1531,6 +1752,45 @@ def handle_tool_call(tool_name: str, tool_input: dict) -> str:
 SONNET_MODEL = "claude-sonnet-4-6"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
+# SHORTCUT routing gate thresholds. The confidence here is the platform
+# DERIVED value (Beta-posterior over verified outcomes), so thresholding it
+# is sound — unlike the old model self-report, an inflated number no longer
+# buys cheaper Haiku processing.
+SHORTCUT_CONFIDENCE_MIN = 0.85
+SHORTCUT_SIMILARITY_MIN = 0.55
+SHORTCUT_CONFIRMATIONS_MIN = 3
+
+
+def _shortcut_eligible(match: dict) -> bool:
+    """Structural gate deciding if a fleet_memory match may fire the Haiku
+    SHORTCUT route. Pure function of the match dict so it is unit-testable.
+
+    Requires ALL of:
+      * derived confidence >= SHORTCUT_CONFIDENCE_MIN (0.85)
+      * confirmations >= SHORTCUT_CONFIRMATIONS_MIN (3) OR provenance
+        == 'verified' — i.e. real corroboration, not a lone high number
+      * not superseded (superseded_by IS NULL — the match came back active,
+        already implied by recall's WHERE, asserted here regardless)
+      * similarity >= SHORTCUT_SIMILARITY_MIN (0.55)
+    """
+    if match.get("superseded_by") is not None:
+        return False
+    try:
+        conf = float(match.get("confidence", 0))
+        sim = float(match.get("similarity", 0))
+        confirmations = int(match.get("confirmations", 0))
+    except (TypeError, ValueError):
+        return False
+    provenance = match.get("provenance")
+    if conf < SHORTCUT_CONFIDENCE_MIN:
+        return False
+    if not (confirmations >= SHORTCUT_CONFIRMATIONS_MIN
+            or provenance == "verified"):
+        return False
+    if sim < SHORTCUT_SIMILARITY_MIN:
+        return False
+    return True
+
 
 def _classify_trigger(trigger: str, client, obs: Optional[AgentObserver] = None) -> str:
     """Classify trigger as 'lookup' or 'investigation'.
@@ -1627,29 +1887,29 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
     #
     # 3. EXPLORE — default path. No high-confidence match, not a
     #    lookup-shape trigger. Sonnet + 15 rounds (the legacy path).
-    SHORTCUT_CONFIDENCE_MIN = 0.85
-    SHORTCUT_SIMILARITY_MIN = 0.55
-
     # Scan ALL Tier 5 matches, not just the top-by-similarity one.
     # The most-similar entry isn't always the most-confident — a
     # generic 0.72-confidence pattern with rich vocabulary overlap
     # can outrank a charger-specific 0.97-confidence entry in cosine
     # space. We want shortcut to fire whenever ANY returned match
-    # passes both gates, preferring the highest confidence among
-    # those that do.
+    # passes the structural gate, preferring the highest DERIVED
+    # confidence among those that do.
+    #
+    # The gate is now STRUCTURAL (_shortcut_eligible): high derived
+    # confidence is necessary but not sufficient — it also requires real
+    # corroboration (confirmations >= 3 or verified provenance) and that
+    # the match is not superseded. A self-reported number can no longer
+    # buy the cheaper Haiku route.
     top_match = ctx.get("top_fleet_match")  # kept for telemetry
     fleet_matches = ctx.get("fleet_matches") or []
 
     best_shortcut_match: Optional[dict] = None
     for m in fleet_matches:
+        if not _shortcut_eligible(m):
+            continue
         try:
             _conf = float(m.get("confidence", 0))
-            _sim = float(m.get("similarity", 0))
         except (TypeError, ValueError):
-            continue
-        if _conf < SHORTCUT_CONFIDENCE_MIN:
-            continue
-        if _sim < SHORTCUT_SIMILARITY_MIN:
             continue
         if (best_shortcut_match is None
                 or _conf > float(best_shortcut_match.get("confidence", 0))):
@@ -1670,6 +1930,9 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
     _eligible_str = (
         f"id={best_shortcut_match.get('id')}"
         f"/conf={best_shortcut_match.get('confidence')}"
+        f"/confirm={best_shortcut_match.get('confirmations')}"
+        f"/contra={best_shortcut_match.get('contradictions')}"
+        f"/prov={best_shortcut_match.get('provenance')}"
         f"/sim={best_shortcut_match.get('similarity')}"
         if best_shortcut_match else "none"
     )

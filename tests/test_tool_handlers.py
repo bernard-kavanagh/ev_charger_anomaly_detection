@@ -26,6 +26,7 @@ from tool_handlers import (
     _extract_keywords, TOKEN_BUDGET_DEFAULT, TOKEN_SAFETY_MARGIN,
     _build_ft_expr, _build_hybrid_sql, _build_vector_sql,
     _validate_identifiers, _hybrid_search,
+    derive_confidence, _shortcut_eligible, verify_outcome,
 )
 from text_bander import (
     band_power, band_voltage, band_temperature, band_earth_leak,
@@ -311,6 +312,154 @@ class TestHybridSearchFallback:
         assert ft_used is False
         assert len(cur.calls) == 1
         assert "FTS_MATCH_WORD" not in cur.calls[0][0]
+
+
+# ============================================================================
+# Derived Confidence (pure function)
+# ============================================================================
+
+class TestDeriveConfidence:
+    def test_provenance_base_rates(self):
+        # No evidence yet → prior base rate for each provenance.
+        assert derive_confidence("session", 0, 0) == 0.50
+        assert derive_confidence("consolidated", 0, 0) == 0.75
+        assert derive_confidence("verified", 0, 0) == pytest.approx(0.86, abs=0.01)
+
+    def test_monotonic_up_in_confirmations(self):
+        prev = derive_confidence("session", 0, 0)
+        for c in range(1, 20):
+            cur = derive_confidence("session", c, 0)
+            assert cur >= prev
+            prev = cur
+
+    def test_monotonic_down_in_contradictions(self):
+        prev = derive_confidence("session", 5, 0)
+        for c in range(1, 20):
+            cur = derive_confidence("session", 5, c)
+            assert cur <= prev
+            prev = cur
+
+    def test_confirmations_beat_contradictions(self):
+        # More confirmations than contradictions → above the base rate.
+        assert derive_confidence("session", 10, 1) > 0.50
+        # The reverse → below it.
+        assert derive_confidence("session", 1, 10) < 0.50
+
+    def test_diminishing_returns(self):
+        # Δ from 3→4 confirmations must be smaller than Δ from 0→1.
+        delta_early = (derive_confidence("session", 1, 0)
+                       - derive_confidence("session", 0, 0))
+        delta_late = (derive_confidence("session", 4, 0)
+                      - derive_confidence("session", 3, 0))
+        assert delta_late < delta_early
+
+    def test_never_reaches_one(self):
+        # Even with absurd corroboration, derived confidence stays < 1.0.
+        assert derive_confidence("verified", 500, 0) == 0.99
+        assert derive_confidence("consolidated", 10_000, 0) < 1.0
+
+    def test_clamps_floor(self):
+        # Overwhelming contradictions floor out at 0.05, never negative/zero.
+        assert derive_confidence("session", 0, 500) == 0.05
+
+    def test_unknown_provenance_falls_back_to_session(self):
+        assert derive_confidence("bogus", 0, 0) == derive_confidence("session", 0, 0)
+
+    def test_returns_rounded_two_dp(self):
+        val = derive_confidence("session", 2, 1)
+        assert round(val, 2) == val
+
+
+# ============================================================================
+# Confidence self-report ratchet removed
+# ============================================================================
+
+class TestRatchetRemoved:
+    def test_greatest_confidence_ratchet_absent(self):
+        """The GREATEST(confidence, %s) self-report ratchet must be gone —
+        confidence is re-derived from counters, never max'd upward."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(os.path.dirname(here), "tool_handlers.py")
+        with open(src) as f:
+            text = f.read()
+        assert "GREATEST(confidence" not in text
+
+
+# ============================================================================
+# SHORTCUT eligibility gate (pure helper)
+# ============================================================================
+
+class TestShortcutEligible:
+    def _match(self, **overrides):
+        base = {
+            "id": 1,
+            "confidence": 0.90,
+            "similarity": 0.70,
+            "confirmations": 5,
+            "contradictions": 0,
+            "provenance": "consolidated",
+            "superseded_by": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_high_conf_high_confirmations_accepted(self):
+        assert _shortcut_eligible(self._match()) is True
+
+    def test_high_conf_low_confirmations_rejected(self):
+        # Confidence passes but only 1 confirmation and not verified.
+        m = self._match(confirmations=1, provenance="consolidated")
+        assert _shortcut_eligible(m) is False
+
+    def test_verified_provenance_low_confirmations_accepted(self):
+        # Verified provenance satisfies the corroboration clause on its own.
+        m = self._match(confirmations=0, provenance="verified")
+        assert _shortcut_eligible(m) is True
+
+    def test_superseded_rejected(self):
+        m = self._match(superseded_by=42)
+        assert _shortcut_eligible(m) is False
+
+    def test_low_confidence_rejected(self):
+        m = self._match(confidence=0.80)
+        assert _shortcut_eligible(m) is False
+
+    def test_low_similarity_rejected(self):
+        m = self._match(similarity=0.40)
+        assert _shortcut_eligible(m) is False
+
+    def test_bad_types_rejected(self):
+        m = self._match(confidence="n/a")
+        assert _shortcut_eligible(m) is False
+
+
+# ============================================================================
+# verify_outcome input validation (no DB)
+# ============================================================================
+
+class TestVerifyOutcomeValidation:
+    def test_bad_outcome_returns_error_without_db(self):
+        # A patched _get_pool would raise if touched — validation must run
+        # first and return before any DB access.
+        with patch("tool_handlers._get_pool",
+                   side_effect=AssertionError("DB must not be touched")):
+            result = json.loads(verify_outcome(reasoning_id=1, outcome="bogus"))
+        assert "error" in result
+        assert result["tool"] == "verify_outcome"
+        assert result["retryable"] is False
+
+    def test_valid_outcomes_pass_validation(self):
+        # Reach past validation into the DB layer; a patched _get_pool
+        # confirms a valid outcome does proceed to DB access.
+        for outcome in ("fixed_as_diagnosed", "different_fault", "no_fault_found"):
+            with patch("tool_handlers._get_pool",
+                       side_effect=RuntimeError("reached DB")) as _pool:
+                result = json.loads(
+                    verify_outcome(reasoning_id=1, outcome=outcome)
+                )
+            # _safe_handler wraps the RuntimeError into a structured error,
+            # proving validation passed and the DB path was entered.
+            assert "error" in result and "reached DB" in result["error"]
 
 
 # ============================================================================

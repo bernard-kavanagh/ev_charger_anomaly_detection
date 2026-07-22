@@ -96,7 +96,7 @@
             "type": "number",
             "minimum": 0,
             "maximum": 1,
-            "description": "Confidence score from 0.0 (pure guess) to 1.0 (certain)."
+            "description": "Your self-assessed confidence 0-1. Recorded for telemetry only — the platform derives decision-grade confidence from verified outcomes and corroboration."
           },
           "resolution": {
             "type": "string",
@@ -169,7 +169,8 @@
           "confidence": {
             "type": "number",
             "minimum": 0,
-            "maximum": 1
+            "maximum": 1,
+            "description": "Your self-assessed confidence 0-1. Recorded for telemetry only — the platform derives decision-grade confidence from verified outcomes and corroboration."
           }
         },
         "required": ["category", "scope", "content"]
