@@ -1838,6 +1838,48 @@ def _classify_trigger(trigger: str, client, obs: Optional[AgentObserver] = None)
     return "lookup" if "lookup" in text else "investigation"
 
 
+# Cap on how many characters of the (potentially wide) evidence_refs
+# payload we inline into the Haiku summary prompt. The full evidence list
+# can balloon the prompt — and the model re-emits its own evidence block in
+# the report anyway — so we only need enough for it to cite the right refs,
+# not the entire JSON. Bounding this keeps the summary call clear of the
+# max_tokens ceiling regardless of how many refs a checkpoint accumulates.
+_SUMMARY_EVIDENCE_CHARS = 400
+
+
+def _build_summary_prompt(checkpoint: dict, charger_id: str, trigger: str) -> str:
+    """
+    Build the Haiku final-report prompt from a reasoning checkpoint row.
+
+    Extracted from run_agent so the prompt budget can be regression-tested
+    (see tests/test_tool_handlers.py::TestSummaryPromptBudget). Keep this
+    lean: the wide checkpoint payload (notably evidence_refs) is bounded so
+    prompt drift can't push the summary call back into truncation. The
+    core report inputs — observation, hypothesis (diagnosed cause) and
+    resolution (recommended action) — are passed through in full. The Tags
+    block is intentionally omitted: it duplicates the model's own structured
+    output and is not referenced by the report instructions.
+    """
+    evidence = str(checkpoint.get("evidence_refs") or "[]")
+    if len(evidence) > _SUMMARY_EVIDENCE_CHARS:
+        evidence = evidence[:_SUMMARY_EVIDENCE_CHARS] + "…(truncated)"
+    return (
+        f"Write a final investigation report for charger {charger_id}.\n\n"
+        f"Original alert: {trigger}\n\n"
+        "Investigation checkpoint:\n"
+        f"  Observation: {checkpoint['observation']}\n"
+        f"  Hypothesis: {checkpoint.get('hypothesis') or '(no hypothesis)'}\n"
+        f"  Confidence: {checkpoint['confidence']}\n"
+        f"  Resolution: {checkpoint['resolution']}\n"
+        f"  Evidence: {evidence}\n"
+        f"  Reasoning ID: {checkpoint['id']}\n\n"
+        "Write a 3-5 paragraph report covering: what was observed, "
+        "the diagnosed cause, the recommended action, and any "
+        "fleet-wide implications. Reference the evidence and the "
+        "reasoning ID."
+    )
+
+
 def run_agent(session_id: str, user_id: str, charger_id: str,
               trigger: str,
               max_tool_rounds: int = 15) -> dict:
@@ -2108,22 +2150,7 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
         )
 
     if checkpoint:
-        summary_prompt = (
-            f"Write a final investigation report for charger {charger_id}.\n\n"
-            f"Original alert: {trigger}\n\n"
-            "Investigation checkpoint:\n"
-            f"  Observation: {checkpoint['observation']}\n"
-            f"  Hypothesis: {checkpoint.get('hypothesis') or '(no hypothesis)'}\n"
-            f"  Confidence: {checkpoint['confidence']}\n"
-            f"  Resolution: {checkpoint['resolution']}\n"
-            f"  Evidence: {checkpoint.get('evidence_refs') or '[]'}\n"
-            f"  Tags: {checkpoint.get('tags') or '[]'}\n"
-            f"  Reasoning ID: {checkpoint['id']}\n\n"
-            "Write a 3-5 paragraph report covering: what was observed, "
-            "the diagnosed cause, the recommended action, and any "
-            "fleet-wide implications. Reference the evidence and the "
-            "reasoning ID."
-        )
+        summary_prompt = _build_summary_prompt(checkpoint, charger_id, trigger)
     else:
         # Fallback: no checkpoint was written (rare — circuit breaker
         # fired before any write_reasoning_checkpoint call, or the model
@@ -2167,7 +2194,12 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 
     summary_response = client.messages.create(
         model=HAIKU_MODEL,
-        max_tokens=1024,
+        # 1536, not 1024: the shortcut-path report was truncating mid-sentence
+        # (e.g. "Status: Escalated to …") once the prompt began carrying a wide
+        # checkpoint payload. Haiku output length varies with how many evidence
+        # refs and structural sections it emits, so the 50% headroom is
+        # deliberate. Prompt size is bounded separately (_build_summary_prompt).
+        max_tokens=1536,
         system=(
             "You are an EV charger fleet diagnostic report writer. "
             "Produce concise, operational reports for field technicians."

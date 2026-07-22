@@ -27,6 +27,7 @@ from tool_handlers import (
     _build_hybrid_sql, _build_vector_sql,
     _validate_identifiers, _hybrid_search,
     derive_confidence, _shortcut_eligible, verify_outcome,
+    _build_summary_prompt,
 )
 from text_bander import (
     band_power, band_voltage, band_temperature, band_earth_leak,
@@ -658,3 +659,82 @@ class TestValidation:
         result = validate_window(window)
         assert result.is_valid
         assert result.cleaned["anomaly_score"] == 1.0
+
+
+# ============================================================================
+# Summary prompt budget
+# ============================================================================
+
+
+class TestSummaryPromptBudget:
+    """
+    Guard against prompt drift re-truncating the Haiku final report.
+
+    The shortcut-path report was cut off mid-sentence once the summary
+    prompt started carrying a wide checkpoint payload against a fixed
+    max_tokens ceiling. The token budget was raised, but the durable fix
+    is keeping the *prompt* lean so output has room. This test locks that
+    in: a realistically-sized checkpoint must still produce a prompt well
+    under budget.
+    """
+
+    # Rough guard-grade estimate — good enough to catch drift, not for
+    # accounting accuracy.
+    @staticmethod
+    def _estimated_tokens(text: str) -> int:
+        return len(text) // 4
+
+    @staticmethod
+    def _realistic_checkpoint() -> dict:
+        """A synthetic checkpoint sized like a real, evidence-heavy run."""
+        return {
+            "id": 84213,
+            "charger_id": "CP-04821",
+            "observation": (
+                "Charger CP-04821 reported six consecutive failed session "
+                "starts across a 40-minute window, each aborting during "
+                "contactor engagement on connector B. " * 4
+            ),
+            "hypothesis": (
+                "Contactor weld on connector B is preventing clean load "
+                "engagement, consistent with the prior fleet pattern. " * 3
+            ),
+            "confidence": 0.82,
+            "resolution": (
+                "Dispatch a field technician to replace the connector B "
+                "contactor assembly and re-run the self-test sequence. " * 3
+            ),
+            # Deliberately wide: the raw evidence list would blow the budget
+            # if inlined whole — the builder is expected to bound it.
+            "evidence_refs": json.dumps(
+                [{"window_id": i, "anomaly_score": 0.9, "ref": f"win-{i}"}
+                 for i in range(40)]
+            ),
+            "tags": json.dumps(
+                ["contactor", "connector-b", "weld", "dispatch", "recurring"]
+            ),
+        }
+
+    def test_prompt_under_budget(self):
+        checkpoint = self._realistic_checkpoint()
+        prompt = _build_summary_prompt(
+            checkpoint,
+            "CP-04821",
+            "6 failed session starts on CP-04821 in 40 minutes",
+        )
+        assert self._estimated_tokens(prompt) < 1200
+
+    def test_wide_evidence_is_bounded(self):
+        """The wide evidence payload must not be inlined verbatim."""
+        checkpoint = self._realistic_checkpoint()
+        prompt = _build_summary_prompt(checkpoint, "CP-04821", "trigger")
+        assert len(prompt) < len(checkpoint["evidence_refs"]) + 4000
+        assert "truncated" in prompt
+
+    def test_core_sections_preserved(self):
+        """Observation, cause and recommended action must survive intact."""
+        checkpoint = self._realistic_checkpoint()
+        prompt = _build_summary_prompt(checkpoint, "CP-04821", "trigger")
+        assert checkpoint["observation"] in prompt
+        assert checkpoint["hypothesis"] in prompt
+        assert checkpoint["resolution"] in prompt
