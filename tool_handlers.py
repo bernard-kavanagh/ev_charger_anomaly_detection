@@ -225,68 +225,74 @@ def _safe_handler(func):
 # can never carry attacker- or bug-supplied SQL. Keep this in sync with
 # the FULLTEXT / VECTOR INDEX definitions in schema.sql.
 _ALLOWED_SQL_IDENTIFIERS = frozenset({
-    # tables (may include a query alias)
+    # tables (bare, no alias — recall_fleet_memory dropped its fm alias)
     "outage_catalog",
-    "fleet_memory fm",
+    "fleet_memory",
     "agent_reasoning",
     # vector columns
     "signature_vec",
-    "fm.memory_vec",
+    "memory_vec",
     "reasoning_vec",
     # fulltext columns — one per FULLTEXT INDEX in schema.sql
     "root_cause",       # ft_outage_root_cause
     "resolution",       # ft_outage_resolution
-    "fm.content",       # ft_memory_content (fleet_memory aliased fm)
-    "content",          # ft_memory_content (unaliased)
+    "content",          # ft_memory_content
     "observation",      # ft_reasoning_obs
 })
 
 
 def _validate_identifiers(table: str, vec_column: str,
-                          ft_columns: list[str]) -> None:
+                          ft_column: Optional[str] = None) -> None:
     """Reject any identifier not on the schema allow-list.
 
     Guards the f-string interpolation in the SQL builders: table,
-    vec_column, and every fulltext column must be known-safe.
+    vec_column, and the (single) fulltext column must be known-safe.
+    ft_column is None on the vector-only path, which carries no
+    FTS_MATCH_WORD() and therefore no fulltext identifier to check.
     """
-    for ident in [table, vec_column, *ft_columns]:
+    idents = [table, vec_column]
+    if ft_column is not None:
+        idents.append(ft_column)
+    for ident in idents:
         if ident not in _ALLOWED_SQL_IDENTIFIERS:
             raise ValueError(f"Disallowed SQL identifier: {ident!r}")
 
 
-def _build_ft_expr(ft_columns: list[str]) -> str:
-    """Build the TiDB full-text score expression.
-
-    TiDB FULLTEXT indexes are one column per index, so per-column
-    FTS_MATCH_WORD() calls are combined with GREATEST(). Each call
-    carries one %s placeholder for the keyword string.
-    """
-    if len(ft_columns) == 1:
-        return f"FTS_MATCH_WORD(%s, {ft_columns[0]})"
-    inner = ", ".join(f"FTS_MATCH_WORD(%s, {col})" for col in ft_columns)
-    return f"GREATEST({inner})"
-
-
-def _build_hybrid_sql(table: str, vec_column: str, ft_columns: list[str],
+def _build_hybrid_sql(table: str, vec_column: str, ft_column: str,
                       where_clauses: list[str]) -> str:
-    """Build the hybrid vector + full-text SQL.
+    """Build the hybrid full-text-filter + vector-rank SQL (Variant B).
 
-    Vector distance stays the primary rank; a matching keyword shaves up
-    to 0.1 off the distance (ft_score * 0.05, clamped by LEAST). The
-    GREATEST/FTS_MATCH_WORD expression is INLINED into ORDER BY rather
-    than referencing the ft_score alias — inlining always parses on
-    TiDB, sidestepping any alias-in-ORDER-BY restriction.
+    TiDB forbids FTS_MATCH_WORD() from being nested inside any other
+    expression in SELECT, and requires a matching bare FTS_MATCH_WORD()
+    in WHERE (error 1221). So per-column GREATEST scoring and the
+    score-boosted ORDER BY that subtracted a clamped fulltext-score term
+    from the distance are both illegal and gone. Instead:
+
+      * FTS_MATCH_WORD appears BARE in SELECT, aliased to ft_score.
+      * FTS_MATCH_WORD appears BARE in WHERE, same query text and column.
+      * ORDER BY references the distance alias ONLY — no arithmetic on
+        the fulltext score.
+
+    Result-set semantics: hybrid results are the subset of rows that
+    keyword-match, ranked by vector distance ascending. A single FULLTEXT
+    column per call (one FTS_MATCH_WORD in SELECT + one in WHERE).
+
+    Placeholder order in the emitted string:
+      SELECT ft (query_text), SELECT vec (query_vec),
+      WHERE ft (query_text), ...other where params..., LIMIT.
     """
-    _validate_identifiers(table, vec_column, ft_columns)
-    ft_expr = _build_ft_expr(ft_columns)
-    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    _validate_identifiers(table, vec_column, ft_column)
+    # The bare FTS_MATCH_WORD in WHERE is the first conjunct; caller's
+    # other where clauses (already %s-parameterised) follow it.
+    all_where = [f"FTS_MATCH_WORD(%s, {ft_column})", *where_clauses]
+    where_sql = "WHERE " + " AND ".join(all_where)
     return f"""
         SELECT *,
-               VEC_COSINE_DISTANCE({vec_column}, %s) AS distance,
-               ({ft_expr}) AS ft_score
+               FTS_MATCH_WORD(%s, {ft_column}) AS ft_score,
+               VEC_COSINE_DISTANCE({vec_column}, %s) AS distance
         FROM {table}
         {where_sql}
-        ORDER BY (VEC_COSINE_DISTANCE({vec_column}, %s) - LEAST(0.1, ({ft_expr}) * 0.05)) ASC
+        ORDER BY distance ASC
         LIMIT %s
     """
 
@@ -294,7 +300,7 @@ def _build_hybrid_sql(table: str, vec_column: str, ft_columns: list[str],
 def _build_vector_sql(table: str, vec_column: str,
                       where_clauses: list[str]) -> str:
     """Build the vector-only fallback SQL."""
-    _validate_identifiers(table, vec_column, [])
+    _validate_identifiers(table, vec_column)
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     return f"""
         SELECT *,
@@ -307,36 +313,43 @@ def _build_vector_sql(table: str, vec_column: str,
 
 
 def _hybrid_search(cur, table: str, vec_column: str,
-                   ft_columns: Optional[list[str]], query_vec: str,
+                   ft_column: Optional[str], query_vec: str,
                    query_text: str, where_clauses: list[str],
                    params: list, limit: int = 5) -> tuple[list[dict], bool]:
     """
-    Combined vector cosine + TiDB full-text search.
+    Full-text-filter + vector-rank search (filter-and-rank, Variant B).
 
     Strategy:
     1. If query_text yields keywords (error codes, model numbers, etc.)
-       and ft_columns are given, add an FTS_MATCH_WORD() boost — vector
-       distance stays the primary rank, keyword matches promote rows.
-    2. Falls back to vector-only if the full-text query errors.
+       and an ft_column is given, run the hybrid query: FTS_MATCH_WORD
+       in WHERE filters to keyword matches, VEC_COSINE_DISTANCE ranks
+       that subset. Results are a keyword-matching subset ranked by
+       vector distance — not the whole catalog re-scored.
+    2. Falls back to vector-only ONLY if the full-text query raises.
 
-    Returns (rows, ft_used) where ft_used is True only when the hybrid
-    full-text query actually ran. When it is False despite keywords
-    being present, the caller surfaces a fallback warning sentinel.
+    Returns (rows, ft_used).
+
+    HARD INVARIANT: ft_used=False means the hybrid query RAISED an
+    exception (or no keywords / no ft_column, so it never ran). It NEVER
+    means the query ran and returned zero rows. A valid hybrid query that
+    matches nothing returns (rows=[], ft_used=True): a legitimate "no
+    keyword matches" answer that the caller must not paper over by
+    silently widening to vector-only.
     """
     # Extract potential keywords (error codes, model names, etc.)
     keywords = _extract_keywords(query_text)
 
-    if keywords and ft_columns:
-        sql = _build_hybrid_sql(table, vec_column, ft_columns, where_clauses)
+    if keywords and ft_column:
+        sql = _build_hybrid_sql(table, vec_column, ft_column, where_clauses)
         keyword_str = " ".join(keywords)
-        # Placeholder order: SELECT distance vec, one keyword per ft column
-        # (SELECT ft_score), WHERE params, ORDER BY distance vec, one
-        # keyword per ft column (ORDER BY ft_expr), LIMIT.
-        n = len(ft_columns)
-        all_params = (
-            [query_vec] + [keyword_str] * n + params
-            + [query_vec] + [keyword_str] * n + [limit]
-        )
+        # Placeholder order (must match _build_hybrid_sql's emitted %s):
+        #   SELECT ft (query_text), SELECT vec (query_vec),
+        #   WHERE ft (query_text), ...other where params..., LIMIT.
+        all_params = [keyword_str, query_vec, keyword_str] + params + [limit]
+        # Empty results from a valid FTS query are a legitimate "no keyword
+        # matches" answer. Do not fall back on empty results — that would
+        # hide the fact that the keyword filter was applied. Only a raised
+        # pymysql.Error (bad SQL, missing index) trips the fallback below.
         try:
             cur.execute(sql, all_params)
             return cur.fetchall(), True
@@ -471,12 +484,13 @@ def search_similar_outages(window_id: int, limit: int = 5,
             # Build a text query from the window's anomaly description
             query_text = build_window_text(window)
 
-            # Only root_cause and resolution have FULLTEXT indexes in
-            # schema.sql (ft_outage_root_cause, ft_outage_resolution);
-            # pattern_name does not, so it is excluded from ft_columns.
+            # Single FTS column per call (TiDB forbids GREATEST() over
+            # multiple FTS_MATCH_WORD in SELECT). root_cause carries the
+            # diagnostic language, so it is the keyword-filter column;
+            # resolution is dropped.
             results, ft_used = _hybrid_search(
                 cur, "outage_catalog", "signature_vec",
-                ["root_cause", "resolution"],
+                "root_cause",
                 window["signature_vec"], query_text,
                 where_clauses, params, limit,
             )
@@ -624,21 +638,26 @@ def recall_fleet_memory(query_text: str,
     vec = embed(query_text)
     with get_db() as db:
         with db.cursor() as cur:
-            where_clauses = ["fm.status = 'active'", "fm.memory_vec IS NOT NULL"]
+            # Bare table + bare column names throughout (no fm alias): this
+            # is a single-table query, so the alias bought nothing and was
+            # an unverified guess inside FTS_MATCH_WORD. Bare names remove
+            # that empirical unknown.
+            where_clauses = ["status = 'active'", "memory_vec IS NOT NULL"]
             params = []
 
             if scope != "any":
                 # Single query: match the specific scope OR global, then rank
-                where_clauses.append("(fm.scope = %s OR fm.scope = 'global')")
+                where_clauses.append("(scope = %s OR scope = 'global')")
                 params.append(scope)
             if category_filter != "any":
-                where_clauses.append("fm.category = %s")
+                where_clauses.append("category = %s")
                 params.append(category_filter)
 
-            # Hybrid search with FULLTEXT boost on content (ft_memory_content).
+            # Hybrid search: FTS keyword filter on content (ft_memory_content),
+            # vector rank on memory_vec.
             results, ft_used = _hybrid_search(
-                cur, "fleet_memory fm", "fm.memory_vec",
-                ["fm.content"], str(vec), query_text,
+                cur, "fleet_memory", "memory_vec",
+                "content", str(vec), query_text,
                 where_clauses, params, limit,
             )
 

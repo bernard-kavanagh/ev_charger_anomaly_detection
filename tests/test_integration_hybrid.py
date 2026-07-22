@@ -107,7 +107,7 @@ def _search(query_text):
     with get_db() as db, db.cursor() as cur:
         return _hybrid_search(
             cur, "outage_catalog", "signature_vec",
-            ["root_cause", "resolution"],
+            "root_cause",
             query_vec, query_text,
             ["pattern_id LIKE %s"], ["ITEST-%"], limit=5,
         )
@@ -145,3 +145,27 @@ class TestHybridSearchIntegration:
         )
         assert ft_used is False, "generic text yields no keywords → vector-only"
         assert rows, "vector path must still return results"
+
+    def test_keyword_absent_from_all_rows_returns_empty_not_vector(
+        self, seeded_catalog
+    ):
+        """Assert 4 (fallback discipline): a keyword present in NO seeded
+        row's root_cause must return (rows=[], ft_used=True).
+
+        This proves the hybrid FTS path executed and correctly returned an
+        empty 'no keyword matches' answer — it did NOT silently degrade to
+        vector-only (which would return the closest rows and hide that the
+        keyword filter matched nothing). 'InternalError' is extracted as a
+        keyword but appears in neither ITEST row's root_cause."""
+        rows, ft_used = _search(
+            "charger reported an InternalError during boot sequence"
+        )
+        assert ft_used is True, (
+            "valid FTS query that matches nothing must report ft_used=True, "
+            "not degrade to the vector path"
+        )
+        # fetchall() may return a tuple or a list depending on the cursor;
+        # assert emptiness type-agnostically rather than == [].
+        assert len(rows) == 0, (
+            f"expected zero keyword matches, got {[r.get('pattern_id') for r in rows]}"
+        )

@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tool_handlers import (
     TiDBEncoder, to_json, count_tokens, effective_budget,
     _extract_keywords, TOKEN_BUDGET_DEFAULT, TOKEN_SAFETY_MARGIN,
-    _build_ft_expr, _build_hybrid_sql, _build_vector_sql,
+    _build_hybrid_sql, _build_vector_sql,
     _validate_identifiers, _hybrid_search,
     derive_confidence, _shortcut_eligible, verify_outcome,
 )
@@ -128,8 +128,14 @@ class TestKeywordExtraction:
 # ============================================================================
 
 class TestHybridSearchSQL:
-    """The SQL builder must emit TiDB FTS_MATCH_WORD, never MySQL
-    MATCH..AGAINST, and keep placeholder count == parameter count."""
+    """Filter-and-rank (Variant B): FTS_MATCH_WORD appears BARE in SELECT
+    and BARE in WHERE (never inside GREATEST/LEAST/arithmetic), ORDER BY
+    references distance only, and placeholder count == parameter count.
+
+    These shape assertions encode TiDB error 1221: FTS_MATCH_WORD must not
+    be nested in any other function/expression in SELECT, and must have a
+    matching FTS_MATCH_WORD in WHERE.
+    """
 
     def _placeholder_count(self, sql):
         return sql.count("%s")
@@ -138,8 +144,7 @@ class TestHybridSearchSQL:
 
     def test_uses_fts_match_word_not_against(self):
         sql = _build_hybrid_sql(
-            "outage_catalog", "signature_vec",
-            ["root_cause", "resolution"], [],
+            "outage_catalog", "signature_vec", "root_cause", [],
         )
         assert "FTS_MATCH_WORD" in sql
         assert "AGAINST" not in sql
@@ -147,66 +152,64 @@ class TestHybridSearchSQL:
 
     def test_ft_score_alias_present(self):
         sql = _build_hybrid_sql(
-            "outage_catalog", "signature_vec", ["root_cause"], [],
+            "outage_catalog", "signature_vec", "root_cause", [],
         )
         assert "AS ft_score" in sql
 
-    # --- single vs multi column -------------------------------------------
+    # --- FTS is never wrapped in another expression (error 1221) ----------
 
-    def test_single_column_is_plain_fts_match_word(self):
-        expr = _build_ft_expr(["fm.content"])
-        assert expr == "FTS_MATCH_WORD(%s, fm.content)"
-        assert "GREATEST" not in expr
+    def test_no_expression_wrapping_of_fts(self):
+        sql = _build_hybrid_sql(
+            "outage_catalog", "signature_vec", "root_cause",
+            ["severity = %s"],
+        )
+        # The two forbidden wrappers from the broken refactor must be gone.
+        assert "GREATEST(" not in sql
+        assert "LEAST(" not in sql
+        # ORDER BY ranks by distance only — no ft_score, no arithmetic.
+        order_by = sql.split("ORDER BY", 1)[1]
+        assert "distance ASC" in order_by
+        assert "FTS_MATCH_WORD" not in order_by
+        assert "ft_score" not in order_by
 
-    def test_multi_column_uses_greatest(self):
-        expr = _build_ft_expr(["root_cause", "resolution"])
-        assert expr.startswith("GREATEST(")
-        assert expr.count("FTS_MATCH_WORD") == 2
-        assert "FTS_MATCH_WORD(%s, root_cause)" in expr
-        assert "FTS_MATCH_WORD(%s, resolution)" in expr
+    def test_fts_appears_bare_in_select_and_where(self):
+        sql = _build_hybrid_sql(
+            "outage_catalog", "signature_vec", "root_cause", [],
+        )
+        # Exactly two FTS_MATCH_WORD calls: one in SELECT, one in WHERE.
+        assert sql.count("FTS_MATCH_WORD") == 2
+        assert "FTS_MATCH_WORD(%s, root_cause) AS ft_score" in sql
+        where = sql.split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+        assert "FTS_MATCH_WORD(%s, root_cause)" in where
 
     # --- placeholder / parameter count parity -----------------------------
 
-    def test_hybrid_placeholder_count_single_column(self):
-        # 1 vec (SELECT distance) + 1 ft (SELECT) + 0 where
-        #  + 1 vec (ORDER BY) + 1 ft (ORDER BY) + 1 limit = 5
+    def test_hybrid_placeholder_count_no_where(self):
+        # 1 ft (SELECT) + 1 vec (SELECT) + 1 ft (WHERE) + 1 limit = 4
         sql = _build_hybrid_sql(
-            "fleet_memory fm", "fm.memory_vec", ["fm.content"], [],
+            "fleet_memory", "memory_vec", "content", [],
         )
-        assert self._placeholder_count(sql) == 5
-
-    def test_hybrid_placeholder_count_multi_column(self):
-        # 1 vec + 2 ft + 0 where + 1 vec + 2 ft + 1 limit = 7
-        sql = _build_hybrid_sql(
-            "outage_catalog", "signature_vec",
-            ["root_cause", "resolution"], [],
-        )
-        assert self._placeholder_count(sql) == 7
+        assert self._placeholder_count(sql) == 4
 
     def test_hybrid_placeholder_count_with_where(self):
-        # multi-column (7) + 2 where placeholders = 9
+        # base (4) + 2 where placeholders = 6
         sql = _build_hybrid_sql(
-            "outage_catalog", "signature_vec",
-            ["root_cause", "resolution"],
+            "outage_catalog", "signature_vec", "root_cause",
             ["severity = %s", "category = %s"],
         )
-        assert self._placeholder_count(sql) == 9
+        assert self._placeholder_count(sql) == 6
 
     def test_hybrid_param_list_matches_placeholders(self):
         # Reproduce the exact param assembly from _hybrid_search and
         # assert it matches the number of %s in the built SQL.
-        ft_columns = ["root_cause", "resolution"]
+        # Order: [query_text, query_vec, query_text, ...where..., limit].
         where_clauses = ["severity = %s"]
         params = ["safety"]
         sql = _build_hybrid_sql(
-            "outage_catalog", "signature_vec", ft_columns, where_clauses,
+            "outage_catalog", "signature_vec", "root_cause", where_clauses,
         )
-        n = len(ft_columns)
         query_vec, keyword_str, limit = "[0.1]", "E-001 GroundFailure", 5
-        all_params = (
-            [query_vec] + [keyword_str] * n + params
-            + [query_vec] + [keyword_str] * n + [limit]
-        )
+        all_params = [keyword_str, query_vec, keyword_str] + params + [limit]
         assert len(all_params) == self._placeholder_count(sql)
 
     def test_vector_fallback_param_parity(self):
@@ -229,28 +232,26 @@ class TestHybridSearchSQL:
         with pytest.raises(ValueError):
             _build_hybrid_sql(
                 "outage_catalog; DROP TABLE users", "signature_vec",
-                ["root_cause"], [],
+                "root_cause", [],
             )
 
     def test_disallowed_vec_column_raises(self):
         with pytest.raises(ValueError):
             _build_hybrid_sql(
-                "outage_catalog", "signature_vec) --", ["root_cause"], [],
+                "outage_catalog", "signature_vec) --", "root_cause", [],
             )
 
     def test_disallowed_ft_column_raises(self):
         with pytest.raises(ValueError):
             _build_hybrid_sql(
                 "outage_catalog", "signature_vec",
-                ["root_cause", "pattern_name"], [],  # pattern_name has no FT index
+                "pattern_name", [],  # pattern_name has no FT index
             )
 
     def test_validate_identifiers_accepts_known(self):
         # Should not raise for the real call-site identifiers.
-        _validate_identifiers("outage_catalog", "signature_vec",
-                              ["root_cause", "resolution"])
-        _validate_identifiers("fleet_memory fm", "fm.memory_vec",
-                              ["fm.content"])
+        _validate_identifiers("outage_catalog", "signature_vec", "root_cause")
+        _validate_identifiers("fleet_memory", "memory_vec", "content")
 
     def test_vector_builder_also_validates(self):
         with pytest.raises(ValueError):
@@ -279,7 +280,7 @@ class TestHybridSearchFallback:
         cur = self._FakeCursor(raise_on_hybrid=False)
         rows, ft_used = _hybrid_search(
             cur, "outage_catalog", "signature_vec",
-            ["root_cause", "resolution"], "[0.1]",
+            "root_cause", "[0.1]",
             "charger showing E-001 fault", [], [], limit=5,
         )
         assert ft_used is True
@@ -291,7 +292,7 @@ class TestHybridSearchFallback:
         cur = self._FakeCursor(raise_on_hybrid=True)
         rows, ft_used = _hybrid_search(
             cur, "outage_catalog", "signature_vec",
-            ["root_cause", "resolution"], "[0.1]",
+            "root_cause", "[0.1]",
             "charger showing E-001 fault", [], [], limit=5,
         )
         assert ft_used is False
@@ -301,11 +302,30 @@ class TestHybridSearchFallback:
         assert "FTS_MATCH_WORD" not in fb_sql
         assert len(fb_params) == fb_sql.count("%s")
 
+    def test_empty_results_do_not_trigger_fallback(self):
+        # HARD INVARIANT: a valid hybrid query that matches zero rows
+        # returns (rows=[], ft_used=True) — it must NOT silently widen to
+        # the vector-only path. ft_used=False is reserved for raised errors.
+        class _EmptyCursor(self._FakeCursor):
+            def fetchall(self):
+                return []
+
+        cur = _EmptyCursor(raise_on_hybrid=False)
+        rows, ft_used = _hybrid_search(
+            cur, "outage_catalog", "signature_vec",
+            "root_cause", "[0.1]",
+            "charger showing E-001 fault", [], [], limit=5,
+        )
+        assert rows == []
+        assert ft_used is True, "empty FTS result is 'no matches', not a fallback"
+        assert len(cur.calls) == 1, "no vector-only fallback query on empty result"
+        assert "FTS_MATCH_WORD" in cur.calls[0][0]
+
     def test_no_keywords_skips_fulltext(self):
         cur = self._FakeCursor(raise_on_hybrid=False)
         rows, ft_used = _hybrid_search(
             cur, "outage_catalog", "signature_vec",
-            ["root_cause"], "[0.1]",
+            "root_cause", "[0.1]",
             "the charger is not working", [], [], limit=5,
         )
         # Generic text yields no keywords → straight to vector-only
