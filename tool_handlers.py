@@ -408,10 +408,18 @@ def _extract_keywords(text: str) -> list[str]:
 # as telemetry only. See migrations/schema_v3_derived_confidence.sql.
 
 # (alpha, beta) Beta priors per provenance — the base rate before evidence.
+#
+# v4: the 'verified' prior shrank from (6, 1) to (2, 1). The promotion event
+# (session -> verified) must NOT double-count the first field confirmation:
+# the verified_confirmations counter does the work, not an inflated prior. A
+# lone confirmation (prior (2,1) + 1 confirmation) now derives (1+2)/(1+3) =
+# 0.75 — below the 0.85 shortcut floor — so a single verification can no longer
+# unlock the shortcut on its own. The gate is conjunctive; the counter carries
+# the corroboration signal.
 _CONFIDENCE_PRIORS = {
     "session": (1, 1),       # base 0.50 — unverified model self-report
     "consolidated": (3, 1),  # base 0.75 — corroborated across >=3 cases
-    "verified": (6, 1),      # base ~0.86 — field-verified outcome
+    "verified": (2, 1),      # base ~0.67 — field-verified provenance, pre-evidence
 }
 _CONFIDENCE_FLOOR = 0.05
 _CONFIDENCE_CEIL = 0.99
@@ -428,7 +436,11 @@ def derive_confidence(provenance: str, confirmations: int,
     Priors (alpha, beta) encode the base rate before any evidence:
         session      -> (1, 1)  base 0.50  (unverified model self-report)
         consolidated -> (3, 1)  base 0.75  (corroborated across >=3 cases)
-        verified     -> (6, 1)  base ~0.86 (field-verified outcome)
+        verified     -> (2, 1)  base ~0.67 (field-verified provenance, pre-evidence)
+
+    v4: callers MUST pass the field-verified counters (verified_confirmations,
+    verified_contradictions), never the agent-authored corroboration /
+    supersede counts. The Beta posterior reflects ground truth only.
 
     Properties:
       * Monotonically INCREASING in ``confirmations``.
@@ -1912,27 +1924,32 @@ def _shortcut_eligible(match: dict) -> bool:
     """Structural gate deciding if a fleet_memory match may fire the Haiku
     SHORTCUT route. Pure function of the match dict so it is unit-testable.
 
-    Requires ALL of:
+    Requires ALL of (conjunctive):
       * derived confidence >= SHORTCUT_CONFIDENCE_MIN (0.85)
-      * confirmations >= SHORTCUT_CONFIRMATIONS_MIN (3) OR provenance
-        == 'verified' — i.e. real corroboration, not a lone high number
+      * verified_confirmations >= SHORTCUT_CONFIRMATIONS_MIN (3) — i.e. at
+        least three FIELD confirmations. Read from the match dict; absent =>
+        0 (fail-closed). Corroborations (agent/consolidation/merge) do NOT
+        count and provenance alone does NOT qualify.
       * not superseded (superseded_by IS NULL — the match came back active,
         already implied by recall's WHERE, asserted here regardless)
       * similarity >= SHORTCUT_SIMILARITY_MIN (0.55)
+
+    v4: the pre-v4 verified-provenance OR-clause is REMOVED. It let a SINGLE
+    field confirmation (session -> verified promotion) unlock the shortcut,
+    making the >=3 requirement decorative. Do NOT reintroduce it — eligibility
+    is gated on verified_confirmations alone, never on provenance.
     """
     if match.get("superseded_by") is not None:
         return False
     try:
         conf = float(match.get("confidence", 0))
         sim = float(match.get("similarity", 0))
-        confirmations = int(match.get("confirmations", 0))
+        verified_confirmations = int(match.get("verified_confirmations", 0))
     except (TypeError, ValueError):
         return False
-    provenance = match.get("provenance")
     if conf < SHORTCUT_CONFIDENCE_MIN:
         return False
-    if not (confirmations >= SHORTCUT_CONFIRMATIONS_MIN
-            or provenance == "verified"):
+    if verified_confirmations < SHORTCUT_CONFIRMATIONS_MIN:
         return False
     if sim < SHORTCUT_SIMILARITY_MIN:
         return False
@@ -2063,11 +2080,12 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 
     # Routing decision. Three paths, evaluated in priority order:
     #
-    # 1. SHORTCUT — Tier 5 of assemble_context found a high-confidence
-    #    fleet_memory match (confidence >= 0.95 AND similarity >= 0.85).
-    #    The cognitive foundation has already seen this pattern, so we
-    #    skip expensive Sonnet reasoning and route to Haiku for verify-
-    #    and-checkpoint in 3 rounds. Skips the classify call too —
+    # 1. SHORTCUT — Tier 5 of assemble_context found a fleet_memory match
+    #    that clears the structural gate (_shortcut_eligible): derived
+    #    confidence >= 0.85, verified_confirmations >= 3, similarity >= 0.55,
+    #    not superseded. The cognitive foundation has already seen this
+    #    pattern, so we skip expensive Sonnet reasoning and route to Haiku
+    #    for verify-and-checkpoint in 3 rounds. Skips the classify call too —
     #    we already know the answer shape.
     #
     # 2. LOOKUP — Haiku classifier reads only the trigger string and
@@ -2086,9 +2104,10 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
     #
     # The gate is now STRUCTURAL (_shortcut_eligible): high derived
     # confidence is necessary but not sufficient — it also requires real
-    # corroboration (confirmations >= 3 or verified provenance) and that
-    # the match is not superseded. A self-reported number can no longer
-    # buy the cheaper Haiku route.
+    # FIELD corroboration (verified_confirmations >= 3; agent/consolidation
+    # corroboration and provenance alone do NOT qualify) and that the match
+    # is not superseded. A self-reported or self-corroborated number can no
+    # longer buy the cheaper Haiku route.
     top_match = ctx.get("top_fleet_match")  # kept for telemetry
     fleet_matches = ctx.get("fleet_matches") or []
 

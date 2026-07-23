@@ -30,6 +30,7 @@ from tool_handlers import (
     derive_confidence, _shortcut_eligible, verify_outcome,
     _build_summary_prompt,
     _flatten_source_refs, _accepted_merge_refs,
+    SHORTCUT_CONFIDENCE_MIN, SHORTCUT_CONFIRMATIONS_MIN,
 )
 from text_bander import (
     band_power, band_voltage, band_temperature, band_earth_leak,
@@ -346,7 +347,8 @@ class TestDeriveConfidence:
         # No evidence yet → prior base rate for each provenance.
         assert derive_confidence("session", 0, 0) == 0.50
         assert derive_confidence("consolidated", 0, 0) == 0.75
-        assert derive_confidence("verified", 0, 0) == pytest.approx(0.86, abs=0.01)
+        # v4: verified prior shrank (6,1) -> (2,1); base ~0.67, not 0.86.
+        assert derive_confidence("verified", 0, 0) == pytest.approx(0.67, abs=0.01)
 
     def test_monotonic_up_in_confirmations(self):
         prev = derive_confidence("session", 0, 0)
@@ -414,30 +416,51 @@ class TestRatchetRemoved:
 
 class TestShortcutEligible:
     def _match(self, **overrides):
+        # v4: eligibility gates on verified_confirmations, NOT the old
+        # confirmations field and NOT provenance.
         base = {
             "id": 1,
             "confidence": 0.90,
             "similarity": 0.70,
-            "confirmations": 5,
-            "contradictions": 0,
-            "provenance": "consolidated",
+            "verified_confirmations": 5,
+            "verified_contradictions": 0,
+            "provenance": "verified",
             "superseded_by": None,
         }
         base.update(overrides)
         return base
 
-    def test_high_conf_high_confirmations_accepted(self):
+    def test_high_conf_high_verified_confirmations_accepted(self):
         assert _shortcut_eligible(self._match()) is True
 
-    def test_high_conf_low_confirmations_rejected(self):
-        # Confidence passes but only 1 confirmation and not verified.
-        m = self._match(confirmations=1, provenance="consolidated")
+    def test_high_conf_low_verified_confirmations_rejected(self):
+        # Confidence passes but only 1 field confirmation.
+        m = self._match(verified_confirmations=1)
         assert _shortcut_eligible(m) is False
 
-    def test_verified_provenance_low_confirmations_accepted(self):
-        # Verified provenance satisfies the corroboration clause on its own.
-        m = self._match(confirmations=0, provenance="verified")
-        assert _shortcut_eligible(m) is True
+    def test_verified_provenance_alone_not_enough(self):
+        # v4: the removed OR-clause used to accept verified provenance with
+        # zero field confirmations. It must now be REJECTED. Pinning this so
+        # the OR-clause is never reintroduced.
+        m = self._match(verified_confirmations=0, provenance="verified")
+        assert _shortcut_eligible(m) is False
+
+    def test_corroborations_do_not_gate(self):
+        # A memory corroborated 50x by agents/merges but never field-verified
+        # is NOT eligible, and its confidence sits at the base rate.
+        m = self._match(
+            confidence=derive_confidence("session", 0, 0),
+            provenance="session",
+            verified_confirmations=0,
+            corroborations=50,
+        )
+        assert _shortcut_eligible(m) is False
+
+    def test_verified_confirmations_absent_treated_as_zero(self):
+        # Fail-closed: a match dict missing verified_confirmations is 0.
+        m = self._match()
+        del m["verified_confirmations"]
+        assert _shortcut_eligible(m) is False
 
     def test_superseded_rejected(self):
         m = self._match(superseded_by=42)
@@ -453,6 +476,80 @@ class TestShortcutEligible:
 
     def test_bad_types_rejected(self):
         m = self._match(confidence="n/a")
+        assert _shortcut_eligible(m) is False
+
+
+# ============================================================================
+# Golden values proving the derived-confidence fix (Task 4)
+# ============================================================================
+
+class TestConfidenceGoldenValues:
+    """Pins the exact numbers that make the counter-split fix correct, using
+    the v4 priors (verified=(2,1), consolidated=(3,1), session=(1,1)). These
+    are decision-grade thresholds; a regression here silently re-opens the
+    shortcut to unverified memories."""
+
+    def _match(self, **kw):
+        base = {"id": 1, "similarity": 0.70, "superseded_by": None}
+        base.update(kw)
+        return base
+
+    def test_audited_memory_no_longer_eligible(self):
+        # The audited memory post-fix: consolidated pattern, ZERO field
+        # verifications. Derives to the consolidated base rate and does NOT
+        # fire the shortcut (the whole point of the migration).
+        conf = derive_confidence("consolidated", 0, 0)
+        assert conf == 0.75
+        m = self._match(confidence=conf, provenance="consolidated",
+                        verified_confirmations=0)
+        assert _shortcut_eligible(m) is False
+
+    def test_single_verification_not_eligible(self):
+        # Pins the removed OR-clause + the shrunk prior. A single field
+        # confirmation on a verified-provenance memory: (1+2)/(1+3) = 0.75,
+        # below 0.85, so NOT eligible.
+        conf = derive_confidence("verified", 1, 0)
+        assert conf == 0.75
+        m = self._match(confidence=conf, provenance="verified",
+                        verified_confirmations=1)
+        assert _shortcut_eligible(m) is False
+
+    def test_three_verifications_below_confidence_floor(self):
+        # verified_confirmations=3: (3+2)/(3+3) = 0.833 -> 0.83, BELOW the
+        # 0.85 confidence floor. The counter clause passes but confidence
+        # does not, so still NOT eligible (the gate is conjunctive).
+        conf = derive_confidence("verified", 3, 0)
+        assert conf == pytest.approx(0.83, abs=0.005)
+        assert conf < SHORTCUT_CONFIDENCE_MIN
+        m = self._match(confidence=conf, provenance="verified",
+                        verified_confirmations=3)
+        assert _shortcut_eligible(m) is False
+
+    def test_four_verifications_eligible(self):
+        # verified_confirmations=4: (4+2)/(4+3) = 0.857 -> 0.86, clears 0.85.
+        # Effectively 4 field confirmations are required for a verified memory
+        # — intended, because the gate is conjunctive.
+        conf = derive_confidence("verified", 4, 0)
+        assert conf == pytest.approx(0.86, abs=0.005)
+        assert conf >= SHORTCUT_CONFIDENCE_MIN
+        assert 4 >= SHORTCUT_CONFIRMATIONS_MIN
+        m = self._match(confidence=conf, provenance="verified",
+                        verified_confirmations=4, similarity=0.70)
+        assert _shortcut_eligible(m) is True
+        # And the low-similarity side of the boundary fails.
+        m_lowsim = self._match(confidence=conf, provenance="verified",
+                               verified_confirmations=4, similarity=0.40)
+        assert _shortcut_eligible(m_lowsim) is False
+
+    def test_contradiction_symmetry(self):
+        # verified_confirmations=4, verified_contradictions=2:
+        # (4+2)/(6+3) = 0.667 -> 0.67, not eligible. supersede_events must NOT
+        # enter the posterior (it is not even an argument to derive_confidence).
+        conf = derive_confidence("verified", 4, 2)
+        assert conf == pytest.approx(0.67, abs=0.005)
+        m = self._match(confidence=conf, provenance="verified",
+                        verified_confirmations=4, verified_contradictions=2,
+                        supersede_events=99)
         assert _shortcut_eligible(m) is False
 
 
