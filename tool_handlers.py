@@ -17,6 +17,7 @@ Changes from v1:
 
 import json
 import os
+import re
 import threading
 import time
 import logging
@@ -452,6 +453,90 @@ def derive_confidence(provenance: str, confirmations: int,
 
 
 # ============================================================================
+# SOURCE_REFS INTEGRITY  (v4)
+# ============================================================================
+#
+# Invariant: every element of fleet_memory.source_refs is a scalar string
+# matching ^[a-z_]+:\d+$ (e.g. "agent_reasoning:48291"). NEVER a nested array.
+#
+# The pre-v4 merge path appended json.dumps(list) as a single element via
+# JSON_ARRAY_APPEND, producing [..., ["agent_reasoning:X"]]. verify_outcome's
+# JSON_CONTAINS(source_refs, '"agent_reasoning:X"') matches only top-level
+# scalars, so nested refs were unreachable and their field verifications never
+# propagated. These helpers enforce the flat-scalar invariant on write and in
+# the repair script.
+
+_SOURCE_REF_RE = re.compile(r"^[a-z_]+:\d+$")
+_AGENT_REASONING_REF_RE = re.compile(r"^agent_reasoning:(\d+)$")
+# A merge may only import refs from checkpoints that are confirmed or promoted.
+_MERGEABLE_RESOLUTIONS = ("confirmed", "promoted")
+
+
+def _flatten_source_refs(value) -> list[str]:
+    """Recursively flatten a possibly-nested source_refs value into a deduped
+    flat list of scalar ref strings matching ^[a-z_]+:\\d+$.
+
+    Accepts None, a JSON-encoded string, a bare scalar, or an arbitrarily
+    nested list. Malformed elements (anything not matching the ref regex) are
+    dropped. Order is preserved; the first occurrence of each ref wins.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "ignore")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            value = [value]  # a bare scalar string
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _walk(v):
+        if isinstance(v, list):
+            for item in v:
+                _walk(item)
+        elif isinstance(v, str) and _SOURCE_REF_RE.match(v):
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+
+    _walk(value)
+    return out
+
+
+def _accepted_merge_refs(cur, refs) -> list[str]:
+    """Filter incoming merge refs for provenance safety (Task 3).
+
+    Keeps only well-formed scalar refs, and for ``agent_reasoning:{id}`` refs,
+    only those whose checkpoint resolution is 'confirmed' or 'promoted'. A
+    merge must never graft refs from escalated / dismissed / superseded
+    checkpoints, nor blend provenance classes (an escalated checkpoint's ref
+    onto a consolidated memory). Refs that fail the check are skipped and
+    logged at debug.
+    """
+    accepted: list[str] = []
+    for ref in _flatten_source_refs(refs):
+        m = _AGENT_REASONING_REF_RE.match(ref)
+        if m:
+            cur.execute(
+                "SELECT resolution FROM agent_reasoning WHERE id = %s",
+                (int(m.group(1)),),
+            )
+            row = cur.fetchone()
+            resolution = row.get("resolution") if row else None
+            if resolution not in _MERGEABLE_RESOLUTIONS:
+                log.debug(
+                    "merge: skipping ref %s — resolution=%r not in %s",
+                    ref, resolution, _MERGEABLE_RESOLUTIONS,
+                )
+                continue
+        accepted.append(ref)
+    return accepted
+
+
+# ============================================================================
 # TOOL HANDLERS
 # ============================================================================
 
@@ -702,7 +787,7 @@ def write_fleet_memory(category: str, scope: str, content: str,
                        source_refs: Optional[list] = None,
                        confidence: float = 0.7,
                        provenance: str = "session",
-                       confirmations: int = 0) -> str:
+                       corroborations: int = 0) -> str:
     """Write or merge a fleet memory record.
 
     UPGRADE: Now checks for semantic contradictions within the same scope
@@ -710,19 +795,27 @@ def write_fleet_memory(category: str, scope: str, content: str,
 
     Confidence handling: the model-supplied `confidence` is stored into
     model_confidence as telemetry only. The decision-grade `confidence`
-    column is DERIVED via derive_confidence() from provenance +
-    confirmation/contradiction counters. `provenance`/`confirmations` are
-    internal knobs (e.g. consolidation writes 'consolidated' with
-    confirmations=len(group)); the agent-facing tool never sets them and
+    column is DERIVED via derive_confidence() from provenance + the
+    field-VERIFIED counters (verified_confirmations, verified_contradictions),
+    which start at zero here — only verify_outcome ever raises them.
+
+    v4 counter split: this handler NEVER touches the verified counters. A
+    merge (Case 1) is agent-authored corroboration → `corroborations`. A
+    supersede (Case 2) is agent-authored churn → `supersede_events`. Neither
+    gates the shortcut nor feeds the posterior. `provenance`/`corroborations`
+    are internal knobs (consolidation writes 'consolidated' with
+    corroborations=len(group)); the agent-facing tool never sets them and
     gets the 'session'/0 defaults.
     """
     vec = embed(content)
 
-    # Look up near-duplicates / candidate contradictions
+    # Look up near-duplicates / candidate contradictions. Only the fields the
+    # merge / supersede paths need: id (target), category (supersede guard),
+    # distance (thresholds). The counters are no longer read here — a merge
+    # bumps corroborations blindly and does NOT re-derive confidence.
     with get_db() as db, db.cursor() as cur:
         cur.execute("""
-            SELECT id, content, confidence, category,
-                   provenance, confirmations, contradictions,
+            SELECT id, category,
                    VEC_COSINE_DISTANCE(memory_vec, %s) AS distance
             FROM fleet_memory
             WHERE status = 'active' AND scope = %s
@@ -731,46 +824,64 @@ def write_fleet_memory(category: str, scope: str, content: str,
         """, (str(vec), scope))
         nearby = cur.fetchall()
 
-    # Case 1: near-duplicate merge — single UPDATE, atomic under autocommit.
-    # A merge is a corroboration event: bump confirmations and RE-DERIVE
-    # confidence from the counters. The old max-with-self-report ratchet
-    # let a single overconfident self-report permanently raise the score;
-    # derive_confidence() only rises with real corroboration and never 1.0.
+    # Case 1: near-duplicate merge. A merge is AGENT-authored corroboration,
+    # not field verification: it bumps `corroborations` only and does NOT
+    # re-derive confidence (the verified counters are unchanged, so the
+    # posterior is unchanged). It is also a read-modify-write of source_refs,
+    # so it runs inside an explicit transaction with SELECT ... FOR UPDATE on
+    # the target row — two concurrent workers merging into the same memory
+    # under autocommit would otherwise silently drop each other's refs.
     if nearby and float(nearby[0]["distance"]) < 0.15:
-        closest = nearby[0]
-        new_confidence = derive_confidence(
-            closest["provenance"],
-            int(closest["confirmations"]) + 1,
-            int(closest["contradictions"]),
-        )
-        with get_db() as db, db.cursor() as cur:
-            cur.execute("""
-                UPDATE fleet_memory
-                SET content = %s,
-                    confirmations = confirmations + 1,
-                    confidence = %s,
-                    supporting_evidence_count = supporting_evidence_count + 1,
-                    source_refs = JSON_ARRAY_APPEND(
-                        COALESCE(source_refs, JSON_ARRAY()), '$', %s
-                    ),
-                    memory_vec = %s
-                WHERE id = %s
-            """, (content, new_confidence,
-                  json.dumps(source_refs or []),
-                  str(vec), closest["id"]))
+        target_id = nearby[0]["id"]
+        db_conn = _get_pool().connection()
+        try:
+            db_conn.begin()
+            with db_conn.cursor() as cur:
+                # Lock the target row BEFORE reading source_refs.
+                cur.execute(
+                    "SELECT source_refs, confidence FROM fleet_memory "
+                    "WHERE id = %s FOR UPDATE",
+                    (target_id,),
+                )
+                locked = cur.fetchone()
+                existing_refs = _flatten_source_refs(
+                    locked.get("source_refs") if locked else None
+                )
+                # Provenance-safe graft: only confirmed/promoted checkpoint
+                # refs may be imported (Task 3). Flat scalar strings only.
+                incoming = _accepted_merge_refs(cur, source_refs or [])
+                merged_refs = _flatten_source_refs(existing_refs + incoming)
+                cur.execute("""
+                    UPDATE fleet_memory
+                    SET content = %s,
+                        corroborations = corroborations + 1,
+                        supporting_evidence_count = supporting_evidence_count + 1,
+                        source_refs = %s,
+                        memory_vec = %s
+                    WHERE id = %s
+                """, (content, json.dumps(merged_refs), str(vec), target_id))
+            db_conn.commit()
+        except Exception:
+            db_conn.rollback()
+            raise
+        finally:
+            db_conn.close()
         return to_json({
             "status": "updated_existing",
-            "memory_id": closest["id"],
-            "confidence": new_confidence,
+            "memory_id": target_id,
+            "confidence": float(locked["confidence"]) if locked else None,
             "message": "Near-duplicate found. Merged with existing memory.",
         })
 
     # Case 2: insert new memory; if it contradicts a prior one, supersede
     # in the same transaction so concurrent readers never see an
     # in-between state and a crash mid-flight rolls back cleanly.
-    # Decision-grade confidence is derived; the model self-report rides
-    # along in model_confidence as telemetry only.
-    derived_confidence = derive_confidence(provenance, confirmations, 0)
+    #
+    # A new memory has ZERO field verifications, so confidence is derived from
+    # the zeroed verified counters (= the provenance base rate). The
+    # agent-authored corroboration count rides in `corroborations`; the model
+    # self-report rides in model_confidence. Both are telemetry to the gate.
+    derived_confidence = derive_confidence(provenance, 0, 0)
     db_conn = _get_pool().connection()
     try:
         db_conn.begin()
@@ -778,34 +889,30 @@ def write_fleet_memory(category: str, scope: str, content: str,
             cur.execute("""
                 INSERT INTO fleet_memory
                     (category, scope, content, source_refs, confidence,
-                     model_confidence, provenance, confirmations,
-                     contradictions, memory_vec)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, %s)
+                     model_confidence, provenance,
+                     verified_confirmations, verified_contradictions,
+                     corroborations, supersede_events, memory_vec)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, %s, 0, %s)
             """, (category, scope, content,
-                  json.dumps(source_refs or []),
-                  derived_confidence, confidence, provenance, confirmations,
+                  json.dumps(_flatten_source_refs(source_refs)),
+                  derived_confidence, confidence, provenance, corroborations,
                   str(vec)))
             memory_id = cur.lastrowid
 
             if (nearby
                     and float(nearby[0]["distance"]) < 0.4
                     and nearby[0]["category"] == category):
-                # The prior memory is contradicted by this new one: record a
-                # contradiction and re-derive its confidence in the same
-                # transaction that supersedes it.
+                # The prior memory is superseded by this new one. This is an
+                # AGENT-authored churn event: record it in supersede_events
+                # and do NOT re-derive the superseded row's confidence from
+                # it (agent churn must not decay a field-verified memory).
                 superseded = nearby[0]
-                superseded_confidence = derive_confidence(
-                    superseded["provenance"],
-                    int(superseded["confirmations"]),
-                    int(superseded["contradictions"]) + 1,
-                )
                 cur.execute("""
                     UPDATE fleet_memory
                     SET status = 'superseded', superseded_by = %s,
-                        contradictions = contradictions + 1,
-                        confidence = %s
+                        supersede_events = supersede_events + 1
                     WHERE id = %s
-                """, (memory_id, superseded_confidence, superseded["id"]))
+                """, (memory_id, superseded["id"]))
         db_conn.commit()
     except Exception:
         db_conn.rollback()
@@ -845,10 +952,15 @@ def verify_outcome(reasoning_id: int, outcome: str,
       * agent_reasoning[reasoning_id].verified_outcome / verified_at set.
       * Every ACTIVE fleet_memory whose source_refs contains
         "agent_reasoning:{reasoning_id}":
-          - fixed_as_diagnosed  -> confirmations += 1, and provenance
+          - fixed_as_diagnosed  -> verified_confirmations += 1, and provenance
             promoted session -> verified
-          - different_fault / no_fault_found -> contradictions += 1
+          - different_fault / no_fault_found -> verified_contradictions += 1
         then confidence re-derived via derive_confidence().
+
+    v4: this is the ONLY code path that writes verified_confirmations or
+    verified_contradictions. Agent-authored merges/supersedes land in the
+    informational corroborations/supersede_events columns and are invisible
+    to the posterior — field ground truth is the sole input here.
     """
     if outcome not in _VERIFY_OUTCOMES:
         # Validate before any DB access.
@@ -879,9 +991,12 @@ def verify_outcome(reasoning_id: int, outcome: str,
                     "retryable": False,
                 })
 
-            # Fleet memories built from this reasoning chain.
+            # Fleet memories built from this reasoning chain. Post-v4-repair
+            # source_refs are flat scalars, so JSON_CONTAINS on the top-level
+            # scalar ref reaches every linked memory.
             cur.execute("""
-                SELECT id, provenance, confirmations, contradictions
+                SELECT id, provenance,
+                       verified_confirmations, verified_contradictions
                 FROM fleet_memory
                 WHERE status = 'active'
                   AND JSON_CONTAINS(source_refs, %s)
@@ -890,31 +1005,32 @@ def verify_outcome(reasoning_id: int, outcome: str,
 
             updated = []
             for row in touched:
-                confirmations = int(row["confirmations"])
-                contradictions = int(row["contradictions"])
+                verified_confirmations = int(row["verified_confirmations"])
+                verified_contradictions = int(row["verified_contradictions"])
                 provenance = row["provenance"]
                 if is_confirmation:
-                    confirmations += 1
+                    verified_confirmations = verified_confirmations + 1
                     if provenance == "session":
                         provenance = "verified"
                 else:
-                    contradictions += 1
+                    verified_contradictions = verified_contradictions + 1
                 new_confidence = derive_confidence(
-                    provenance, confirmations, contradictions
+                    provenance, verified_confirmations, verified_contradictions
                 )
                 cur.execute("""
                     UPDATE fleet_memory
-                    SET confirmations = %s, contradictions = %s,
+                    SET verified_confirmations = %s,
+                        verified_contradictions = %s,
                         provenance = %s, confidence = %s
                     WHERE id = %s
-                """, (confirmations, contradictions, provenance,
-                      new_confidence, row["id"]))
+                """, (verified_confirmations, verified_contradictions,
+                      provenance, new_confidence, row["id"]))
                 updated.append({
                     "memory_id": row["id"],
                     "confidence": new_confidence,
                     "provenance": provenance,
-                    "confirmations": confirmations,
-                    "contradictions": contradictions,
+                    "verified_confirmations": verified_confirmations,
+                    "verified_contradictions": verified_contradictions,
                 })
         db_conn.commit()
     except Exception:
@@ -1522,21 +1638,33 @@ def consolidation_job():
                 else:
                     scope = "global"
 
-                # Confidence is NOT hardcoded: it falls out of
-                # derive_confidence('consolidated', len(group), 0). A group
-                # of N confirmed cases IS the corroboration.
+                # Consolidation provenance invariant (Task 5): every ref we
+                # write must point at a checkpoint we are about to promote in
+                # the SAME step. The refs and the promotion set are derived
+                # from one list so they cannot drift; the guard asserts it.
+                promote_ids = [g["id"] for g in group]
+                group_refs = [f"agent_reasoning:{gid}" for gid in promote_ids]
+                assert all(
+                    _AGENT_REASONING_REF_RE.match(r)
+                    and int(_AGENT_REASONING_REF_RE.match(r).group(1)) in set(promote_ids)
+                    for r in group_refs
+                ), "consolidation ref set must equal the promotion set"
+
+                # Confidence is NOT hardcoded: a fresh consolidated memory has
+                # zero field verifications, so it derives to the 'consolidated'
+                # base rate (0.75) and stays there until verify_outcome fires.
+                # The group size is AGENT corroboration -> corroborations.
                 write_fleet_memory(
                     category="pattern", scope=scope, content=content,
-                    source_refs=[f"agent_reasoning:{g['id']}" for g in group],
-                    provenance="consolidated", confirmations=len(group),
+                    source_refs=group_refs,
+                    provenance="consolidated", corroborations=len(group),
                 )
-                ids = [g["id"] for g in group]
-                placeholders = ",".join(["%s"] * len(ids))
+                placeholders = ",".join(["%s"] * len(promote_ids))
                 cur.execute(f"""
                     UPDATE agent_reasoning
                     SET resolution = 'promoted'
                     WHERE id IN ({placeholders})
-                """, ids)
+                """, promote_ids)
                 promoted += 1
 
     return f"Consolidation complete. Promoted {promoted} pattern(s) to fleet memory."
@@ -1991,8 +2119,9 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
     _eligible_str = (
         f"id={best_shortcut_match.get('id')}"
         f"/conf={best_shortcut_match.get('confidence')}"
-        f"/confirm={best_shortcut_match.get('confirmations')}"
-        f"/contra={best_shortcut_match.get('contradictions')}"
+        f"/vconfirm={best_shortcut_match.get('verified_confirmations')}"
+        f"/vcontra={best_shortcut_match.get('verified_contradictions')}"
+        f"/corrob={best_shortcut_match.get('corroborations')}"
         f"/prov={best_shortcut_match.get('provenance')}"
         f"/sim={best_shortcut_match.get('similarity')}"
         if best_shortcut_match else "none"

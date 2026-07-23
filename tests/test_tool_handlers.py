@@ -10,6 +10,7 @@ Run: python -m pytest tests/test_tool_handlers.py -v
 import json
 import pytest
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 from decimal import Decimal
 from datetime import datetime
 
@@ -28,6 +29,7 @@ from tool_handlers import (
     _validate_identifiers, _hybrid_search,
     derive_confidence, _shortcut_eligible, verify_outcome,
     _build_summary_prompt,
+    _flatten_source_refs, _accepted_merge_refs,
 )
 from text_bander import (
     band_power, band_voltage, band_temperature, band_earth_leak,
@@ -738,3 +740,165 @@ class TestSummaryPromptBudget:
         assert checkpoint["observation"] in prompt
         assert checkpoint["hypothesis"] in prompt
         assert checkpoint["resolution"] in prompt
+
+
+# ============================================================================
+# source_refs flattening (Task 2)
+# ============================================================================
+
+_REF_RE = __import__("re").compile(r"^[a-z_]+:\d+$")
+
+
+class TestSourceRefsFlattening:
+    def test_source_refs_are_flat_scalars(self):
+        # A nested payload like the pre-v4 JSON_ARRAY_APPEND bug produced:
+        # some scalars, some singleton nested arrays, some deeply nested.
+        nested = [
+            "agent_reasoning:1",
+            ["agent_reasoning:2"],
+            [["agent_reasoning:3"]],
+            "agent_reasoning:1",           # duplicate -> deduped
+        ]
+        flat = _flatten_source_refs(nested)
+        assert flat == ["agent_reasoning:1", "agent_reasoning:2",
+                        "agent_reasoning:3"]
+        # Every element is a scalar string matching the ref regex; none a list.
+        for el in flat:
+            assert isinstance(el, str)
+            assert not isinstance(el, list)
+            assert _REF_RE.match(el)
+        # And it round-trips through JSON as a flat array (what the merge writes).
+        assert json.loads(json.dumps(flat)) == flat
+
+    def test_json_string_input_is_decoded_and_flattened(self):
+        # DictCursor returns JSON columns as strings; the merge reads them back.
+        raw = json.dumps(["agent_reasoning:10", ["agent_reasoning:11"]])
+        assert _flatten_source_refs(raw) == ["agent_reasoning:10",
+                                             "agent_reasoning:11"]
+
+    def test_malformed_elements_dropped(self):
+        messy = ["agent_reasoning:1", "not a ref", "AGENT:99", 42, None,
+                 "agent_reasoning:", ":5"]
+        assert _flatten_source_refs(messy) == ["agent_reasoning:1"]
+
+    def test_none_and_empty(self):
+        assert _flatten_source_refs(None) == []
+        assert _flatten_source_refs([]) == []
+        assert _flatten_source_refs("null") == []
+
+
+# ============================================================================
+# Provenance-safe merges (Task 3)
+# ============================================================================
+
+class TestMergeProvenanceSafe:
+    class _FakeCursor:
+        """Returns a scripted resolution per agent_reasoning id."""
+        def __init__(self, resolutions):
+            self.resolutions = resolutions  # {id: resolution}
+            self._last = None
+
+        def execute(self, sql, params):
+            self._last = int(params[0])
+
+        def fetchone(self):
+            res = self.resolutions.get(self._last)
+            return {"resolution": res} if res is not None else None
+
+    def test_merge_rejects_escalated_ref(self):
+        # ref 1 is escalated -> rejected; ref 2 is confirmed -> kept.
+        cur = self._FakeCursor({1: "escalated", 2: "confirmed"})
+        accepted = _accepted_merge_refs(
+            cur, ["agent_reasoning:1", "agent_reasoning:2"]
+        )
+        assert "agent_reasoning:1" not in accepted
+        assert accepted == ["agent_reasoning:2"]
+
+    def test_merge_accepts_promoted_and_confirmed_only(self):
+        cur = self._FakeCursor({
+            10: "confirmed", 11: "promoted",
+            12: "dismissed", 13: "escalated",
+        })
+        accepted = _accepted_merge_refs(cur, [
+            "agent_reasoning:10", "agent_reasoning:11",
+            "agent_reasoning:12", "agent_reasoning:13",
+        ])
+        assert accepted == ["agent_reasoning:10", "agent_reasoning:11"]
+
+    def test_merge_rejects_ref_to_missing_checkpoint(self):
+        cur = self._FakeCursor({})  # id 99 not present -> fetchone None
+        assert _accepted_merge_refs(cur, ["agent_reasoning:99"]) == []
+
+
+# ============================================================================
+# Consolidation provenance invariant (Task 5)
+# ============================================================================
+
+class TestConsolidationInvariant:
+    def test_consolidation_only_references_promoted(self):
+        """Every ref consolidation writes must point at a checkpoint it is
+        about to flip to 'promoted' in the same step."""
+        from tool_handlers import consolidation_job
+
+        confirmed_rows = [
+            {"charger_id": f"CP-{i}", "site_id": "S1",
+             "observation": "obs", "hypothesis": "hyp",
+             "tags": json.dumps(["contactor", "weld"]), "id": i,
+             "manufacturer": "ABB", "model": "Terra-54",
+             "environment": "coastal"}
+            for i in (101, 102, 103)
+        ]
+
+        captured = {"refs": None, "promoted_ids": None}
+
+        class _FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, sql, params=None):
+                if sql.strip().startswith("SELECT") and "agent_reasoning" in sql:
+                    self._mode = "select"
+                elif "UPDATE agent_reasoning" in sql and "promoted" in sql:
+                    captured["promoted_ids"] = list(params)
+
+            def fetchall(self):
+                return confirmed_rows
+
+        class _FakeDB:
+            def cursor(self):
+                return _FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def _fake_write_fleet_memory(*, category, scope, content,
+                                     source_refs, provenance, corroborations):
+            captured["refs"] = source_refs
+            return "{}"
+
+        # Haiku synthesis: return a fake response object.
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="pattern")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+        # `anthropic` may not be installed in the test env; consolidation_job
+        # does `import anthropic` internally, so inject a fake module.
+        fake_anthropic = SimpleNamespace(Anthropic=lambda: fake_client)
+
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}), \
+             patch("tool_handlers.get_db", return_value=_FakeDB()), \
+             patch("tool_handlers.write_fleet_memory",
+                   side_effect=_fake_write_fleet_memory):
+            consolidation_job()
+
+        assert captured["refs"] is not None, "write_fleet_memory was not called"
+        ref_ids = {int(r.split(":", 1)[1]) for r in captured["refs"]}
+        promoted = set(captured["promoted_ids"])
+        assert ref_ids == promoted == {101, 102, 103}
