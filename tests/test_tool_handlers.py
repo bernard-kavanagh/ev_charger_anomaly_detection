@@ -29,7 +29,7 @@ from tool_handlers import (
     _validate_identifiers, _hybrid_search,
     derive_confidence, _shortcut_eligible, verify_outcome,
     _build_summary_prompt,
-    _flatten_source_refs, _accepted_merge_refs,
+    _flatten_source_refs, _accepted_merge_refs, _run_agent_loop,
     SHORTCUT_CONFIDENCE_MIN, SHORTCUT_CONFIRMATIONS_MIN,
 )
 from text_bander import (
@@ -999,3 +999,107 @@ class TestConsolidationInvariant:
         ref_ids = {int(r.split(":", 1)[1]) for r in captured["refs"]}
         promoted = set(captured["promoted_ids"])
         assert ref_ids == promoted == {101, 102, 103}
+
+
+# ============================================================================
+# Agent loop stop_reason handling (Task 6, F2)
+# ============================================================================
+
+def _resp(stop_reason, blocks=None):
+    """Build a fake Anthropic response with a usage namespace."""
+    return SimpleNamespace(
+        stop_reason=stop_reason,
+        content=blocks if blocks is not None else [
+            SimpleNamespace(type="text", text="ok")
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+    )
+
+
+def _tool_block(name="recall_fleet_memory", tool_id="t1", tool_input=None):
+    return SimpleNamespace(type="tool_use", name=name, id=tool_id,
+                           input=tool_input or {})
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, **kwargs):
+        self.calls += 1
+        return self._responses.pop(0)
+
+
+class TestAgentLoopStopReason:
+    def _run(self, responses, max_rounds=5):
+        client = _FakeClient(responses)
+        obs = MagicMock()
+        messages = [{"role": "user", "content": "trigger"}]
+        counts, degraded, reason = _run_agent_loop(
+            client, "claude-haiku-4-5", [{"type": "text", "text": "sys"}],
+            [], messages, max_rounds, obs,
+        )
+        return client, obs, messages, counts, degraded, reason
+
+    def test_loop_terminates_on_end_turn(self):
+        client, obs, messages, counts, degraded, reason = self._run(
+            [_resp("end_turn")]
+        )
+        assert client.calls == 1
+        assert degraded is False and reason is None
+        # Assistant message appended, no tool calls executed.
+        assert messages[-1]["role"] == "assistant"
+        assert counts == {}
+
+    def test_loop_continues_on_tool_use(self):
+        responses = [
+            _resp("tool_use", [_tool_block()]),
+            _resp("end_turn"),
+        ]
+        with patch("tool_handlers.handle_tool_call",
+                   return_value='{"memories": []}') as htc:
+            client, obs, messages, counts, degraded, reason = self._run(responses)
+        assert client.calls == 2
+        assert degraded is False and reason is None
+        htc.assert_called_once()
+        assert counts == {"recall_fleet_memory": 1}
+        # A tool_result user turn was appended after the tool_use turn.
+        assert any(
+            m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and m["content"][0].get("type") == "tool_result"
+            for m in messages
+        )
+
+    def test_loop_retries_once_on_max_tokens(self):
+        # First turn truncates, retry succeeds with end_turn -> not degraded.
+        responses = [_resp("max_tokens"), _resp("end_turn")]
+        client, obs, messages, counts, degraded, reason = self._run(responses)
+        assert client.calls == 2  # original + one retry, no third
+        assert degraded is False and reason is None
+
+    def test_double_truncation_marks_degraded(self):
+        responses = [_resp("max_tokens"), _resp("max_tokens")]
+        client, obs, messages, counts, degraded, reason = self._run(responses)
+        assert client.calls == 2  # retried exactly once
+        assert degraded is True
+        assert reason == "max_tokens_truncation"
+        obs.circuit_breaker.assert_any_call("max_tokens_truncation",
+                                            "claude-haiku-4-5")
+
+    def test_refusal_marks_degraded(self):
+        client, obs, messages, counts, degraded, reason = self._run(
+            [_resp("refusal")]
+        )
+        assert client.calls == 1
+        assert degraded is True
+        assert reason == "refusal"
+        obs.circuit_breaker.assert_called()
+
+    def test_unexpected_stop_reason_marks_degraded(self):
+        client, obs, messages, counts, degraded, reason = self._run(
+            [_resp("something_new")]
+        )
+        assert degraded is True
+        assert reason.startswith("unexpected_stop_reason")

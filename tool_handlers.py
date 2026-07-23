@@ -2025,6 +2025,204 @@ def _build_summary_prompt(checkpoint: dict, charger_id: str, trigger: str) -> st
     )
 
 
+# Human-readable one-liners for the degraded-summary prompt.
+_DEGRADED_REASONS = {
+    "max_tokens_truncation": (
+        "the model's response was truncated by the output-token limit twice "
+        "in a row (once after the limit was doubled), so its reasoning is "
+        "incomplete"
+    ),
+    "refusal": "the model declined to continue the investigation",
+}
+
+
+def _build_degraded_summary_prompt(checkpoint: Optional[dict], charger_id: str,
+                                   trigger: str, reason: str) -> str:
+    """Build the Haiku report prompt for a DEGRADED investigation (Task 6).
+
+    A degraded outcome (double max_tokens truncation, refusal, or an
+    unrecognized stop_reason) is never a completed one. The prompt must make
+    the report state that the investigation did not finish and that findings
+    are PARTIAL — it must not present a conclusion. Any checkpoint that does
+    exist is offered as partial context only, explicitly not as a verdict.
+    """
+    why = _DEGRADED_REASONS.get(reason, f"the investigation ended abnormally ({reason})")
+    partial = "(no reasoning checkpoint was written)"
+    if checkpoint:
+        obs_text = str(checkpoint.get("observation") or "")[:400]
+        hyp_text = str(checkpoint.get("hypothesis") or "(none)")[:400]
+        partial = (
+            "Partial reasoning captured before the investigation degraded "
+            "(treat as UNCONFIRMED, not a conclusion):\n"
+            f"  Observation: {obs_text}\n"
+            f"  Tentative hypothesis: {hyp_text}"
+        )
+    return (
+        f"Write a final investigation report for charger {charger_id}.\n\n"
+        f"Original alert: {trigger}\n\n"
+        f"IMPORTANT: This investigation was DEGRADED — {why}. "
+        "The findings below are PARTIAL and must not be reported as a "
+        "confirmed diagnosis or a recommended fix.\n\n"
+        f"{partial}\n\n"
+        "Write a 2-3 paragraph report that: (1) states clearly that the "
+        "investigation did not complete and why, (2) summarises what was "
+        "observed so far without asserting a root cause, and (3) recommends "
+        "that the investigation be re-run or escalated to a human. Do NOT "
+        "present a conclusion."
+    )
+
+
+def _run_agent_loop(client, loop_model: str, cached_system: list,
+                    tools: list, messages: list, max_tool_rounds: int,
+                    obs: AgentObserver) -> tuple[dict, bool, Optional[str]]:
+    """Drive the Claude tool loop, branching EXHAUSTIVELY on stop_reason.
+
+    Mutates ``messages`` in place. Returns (tool_call_counts, degraded,
+    degraded_reason).
+
+    stop_reason handling (Task 6 — exhaustive, not two-cases-plus-else):
+      * 'tool_use'   -> execute tools, append results, continue the loop.
+      * 'end_turn'   -> terminate normally.
+      * 'max_tokens' -> truncation is a DEGRADED outcome, never a completed
+                        one. Retry the SAME turn ONCE with max_tokens doubled.
+                        If the retry also truncates: flag degraded via the
+                        observer and stop WITHOUT processing the truncated
+                        turn (so no confirmed checkpoint is written from it).
+      * 'refusal' / any unrecognized value -> terminate, flag degraded via
+                        the observer. Fail loudly, never silently.
+    """
+    tool_call_counts: dict[str, int] = {}
+    last_tools: list[str] = []  # Track consecutive tool calls
+    degraded = False
+    degraded_reason: Optional[str] = None
+
+    def _record(resp):
+        obs.record_api_call(
+            role="loop",
+            model=loop_model,
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+            cache_creation_input_tokens=getattr(
+                resp.usage, "cache_creation_input_tokens", 0
+            ) or 0,
+            cache_read_input_tokens=getattr(
+                resp.usage, "cache_read_input_tokens", 0
+            ) or 0,
+        )
+
+    for iteration in range(1, max_tool_rounds + 1):
+        response = client.messages.create(
+            model=loop_model,
+            max_tokens=2048,
+            system=cached_system,
+            tools=tools,
+            messages=messages,
+        )
+        _record(response)
+        stop_reason = response.stop_reason
+
+        if stop_reason == "max_tokens":
+            # Retry the SAME turn once with the output budget doubled. Do NOT
+            # append the truncated response or execute its (partial) tools —
+            # we re-issue against the identical `messages`.
+            log.warning(
+                "max_tokens truncation on iteration %d; retrying once with "
+                "max_tokens doubled (2048 -> 4096).", iteration,
+            )
+            response = client.messages.create(
+                model=loop_model,
+                max_tokens=4096,
+                system=cached_system,
+                tools=tools,
+                messages=messages,
+            )
+            _record(response)
+            stop_reason = response.stop_reason
+            if stop_reason == "max_tokens":
+                # Double truncation: degraded. Do not write a confirmed
+                # checkpoint from a truncated turn — stop before processing.
+                obs.circuit_breaker("max_tokens_truncation", loop_model)
+                log.warning(
+                    "Double max_tokens truncation at iteration %d; marking "
+                    "session degraded.", iteration,
+                )
+                degraded, degraded_reason = True, "max_tokens_truncation"
+                break
+
+        assistant_content = response.content
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        if stop_reason == "tool_use":
+            tool_calls = [b for b in assistant_content if b.type == "tool_use"]
+            if not tool_calls:
+                # stop_reason says tool_use but no tool blocks present —
+                # nothing to execute; terminate rather than spin.
+                break
+
+            # Circuit breaker: same tool 3x consecutively
+            current_tools = [tc.name for tc in tool_calls]
+            obs.loop_iteration(iteration, current_tools)
+
+            if len(last_tools) >= 2 and all(
+                t == current_tools[0]
+                for t in last_tools[-2:] + current_tools[:1]
+            ):
+                obs.circuit_breaker("same_tool_3x_consecutive", current_tools[0])
+                log.warning(
+                    f"Circuit breaker: {current_tools[0]} called 3x "
+                    f"consecutively. Halting agent loop at iteration {iteration}."
+                )
+                break
+
+            last_tools.extend(current_tools)
+
+            # Handle each tool call with observability
+            tool_results = []
+            for tc in tool_calls:
+                obs.tool_call_start(tc.name, tc.input)
+                tool_call_counts[tc.name] = tool_call_counts.get(tc.name, 0) + 1
+
+                result = handle_tool_call(tc.name, tc.input)
+
+                # Extract result size for observability
+                try:
+                    parsed = json.loads(result)
+                    result_size = len(parsed.get("similar_outages", []) or
+                                      parsed.get("diagnoses", []) or
+                                      parsed.get("memories", []) or
+                                      parsed.get("windows", []) or [])
+                except (json.JSONDecodeError, AttributeError):
+                    result_size = 0
+
+                obs.tool_call_end(tc.name, result_size=result_size)
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": result,
+                })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        if stop_reason == "end_turn":
+            # Normal termination.
+            break
+
+        # 'refusal' or any unrecognized stop_reason: fail loudly.
+        obs.circuit_breaker("unexpected_stop_reason", str(stop_reason))
+        log.warning(
+            "Unexpected stop_reason %r at iteration %d; marking session "
+            "degraded.", stop_reason, iteration,
+        )
+        degraded = True
+        degraded_reason = stop_reason if stop_reason == "refusal" else (
+            f"unexpected_stop_reason:{stop_reason}"
+        )
+        break
+
+    return tool_call_counts, degraded, degraded_reason
+
+
 def run_agent(session_id: str, user_id: str, charger_id: str,
               trigger: str,
               max_tool_rounds: int = 15) -> dict:
@@ -2183,9 +2381,6 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 
     messages = [{"role": "user", "content": trigger}]
 
-    tool_call_counts: dict[str, int] = {}
-    last_tools: list[str] = []  # Track consecutive tool calls
-
     # Step 4: Agent loop with circuit breaker.
     # The system prompt is byte-identical across all iterations of this
     # investigation, so we cache it. Render order is tools → system →
@@ -2200,74 +2395,10 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
         "cache_control": {"type": "ephemeral"},
     }]
 
-    for iteration in range(1, max_tool_rounds + 1):
-        response = client.messages.create(
-            model=loop_model,
-            max_tokens=2048,
-            system=cached_system,
-            tools=tools_config["tools"],
-            messages=messages,
-        )
-        obs.record_api_call(
-            role="loop",
-            model=loop_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            cache_creation_input_tokens=getattr(
-                response.usage, "cache_creation_input_tokens", 0
-            ) or 0,
-            cache_read_input_tokens=getattr(
-                response.usage, "cache_read_input_tokens", 0
-            ) or 0,
-        )
-
-        assistant_content = response.content
-        messages.append({"role": "assistant", "content": assistant_content})
-
-        tool_calls = [b for b in assistant_content if b.type == "tool_use"]
-        if not tool_calls:
-            break
-
-        # Circuit breaker: same tool 3x consecutively
-        current_tools = [tc.name for tc in tool_calls]
-        obs.loop_iteration(iteration, current_tools)
-
-        if len(last_tools) >= 2 and all(t == current_tools[0] for t in last_tools[-2:] + current_tools[:1]):
-            obs.circuit_breaker("same_tool_3x_consecutive", current_tools[0])
-            log.warning(
-                f"Circuit breaker: {current_tools[0]} called 3x consecutively. "
-                f"Halting agent loop at iteration {iteration}."
-            )
-            break
-
-        last_tools.extend(current_tools)
-
-        # Handle each tool call with observability
-        tool_results = []
-        for tc in tool_calls:
-            obs.tool_call_start(tc.name, tc.input)
-            tool_call_counts[tc.name] = tool_call_counts.get(tc.name, 0) + 1
-
-            result = handle_tool_call(tc.name, tc.input)
-
-            # Extract result size and top distance for observability
-            try:
-                parsed = json.loads(result)
-                result_size = len(parsed.get("similar_outages", []) or
-                                  parsed.get("diagnoses", []) or
-                                  parsed.get("memories", []) or
-                                  parsed.get("windows", []) or [])
-            except (json.JSONDecodeError, AttributeError):
-                result_size = 0
-
-            obs.tool_call_end(tc.name, result_size=result_size)
-
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tc.id,
-                "content": result,
-            })
-        messages.append({"role": "user", "content": tool_results})
+    tool_call_counts, degraded, degraded_reason = _run_agent_loop(
+        client, loop_model, cached_system, tools_config["tools"],
+        messages, max_tool_rounds, obs,
+    )
 
     # Force a clean final summary via Haiku, but DO NOT replay the full
     # `messages` array. The loop already wrote a structured checkpoint
@@ -2297,7 +2428,15 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
             "Could not fetch checkpoint for session %s: %s", session_id, e
         )
 
-    if checkpoint:
+    if degraded:
+        # A degraded run (double truncation / refusal / unexpected stop) is
+        # NOT a completed investigation. Regardless of whether a checkpoint
+        # row exists, the report must say so and must not present a
+        # conclusion — the checkpoint (if any) is offered as partial context.
+        summary_prompt = _build_degraded_summary_prompt(
+            checkpoint, charger_id, trigger, degraded_reason or "unknown"
+        )
+    elif checkpoint:
         summary_prompt = _build_summary_prompt(checkpoint, charger_id, trigger)
     else:
         # Fallback: no checkpoint was written (rare — circuit breaker
@@ -2386,5 +2525,7 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
         "api_input_tokens": obs.api_input_tokens,
         "api_output_tokens": obs.api_output_tokens,
         "api_calls_by_role": dict(obs.api_calls_by_role),
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
         "observability": obs.summary(),
     }
