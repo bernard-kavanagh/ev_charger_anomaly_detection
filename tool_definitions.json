@@ -179,7 +179,7 @@
 
     {
       "name": "get_charger_context",
-      "description": "Retrieve a pre-assembled context snapshot for a charger or site. These snapshots are cached summaries that include the charger's profile, recent anomalies, maintenance history, and performance baselines — everything the agent needs to understand a charger's situation without querying raw telemetry. If the snapshot is stale or missing, the system will regenerate it.",
+      "description": "Retrieve a pre-assembled context snapshot for a charger or site. These snapshots are cached summaries that include the charger's profile, recent anomalies, and active investigations — everything the agent needs to understand a charger's situation without querying raw telemetry. If the snapshot is stale or missing, the system will regenerate it.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -196,7 +196,7 @@
             "type": "array",
             "items": {
               "type": "string",
-              "enum": ["profile", "recent_anomalies", "maintenance_history", "performance_baseline", "active_investigations"]
+              "enum": ["profile", "recent_anomalies", "active_investigations"]
             },
             "description": "Which snapshot types to retrieve. Omit to get all available.",
             "default": ["profile", "recent_anomalies"]
