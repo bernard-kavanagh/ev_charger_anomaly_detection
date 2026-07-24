@@ -7,14 +7,27 @@ AFTER applying migrations/schema_v4_counter_split.sql (which adds the
 verified_confirmations / verified_contradictions / corroborations /
 supersede_events columns) and BEFORE relying on the new derived confidence.
 
+  Phase 0 — ref-grammar discovery (dry-run diagnostic, no writes ever)
+      Parses (does not regex-guess) every ref across fleet_memory.source_refs
+      and agent_reasoning.evidence_refs, recovering stringified layers, and
+      prints the DISTINCT prefixes/formats actually present plus any value the
+      widened validation pattern still rejects. This is how the true grammar
+      is established empirically before Phase 1 relies on it.
+
   Phase 1 — source_refs flattening
-      The pre-v4 merge path appended json.dumps(list) via JSON_ARRAY_APPEND,
-      producing nested arrays like [..., ["agent_reasoning:X"]]. Those nested
-      refs are invisible to verify_outcome's JSON_CONTAINS on a top-level
+      Two pre-v4 corruptions buried refs below the top level:
+        * stringified arrays — the merge path appended json.dumps(list) as a
+          single *string* element, e.g. [..., '["agent_reasoning:X"]']. This
+          is what the cluster-2 dry-run actually found (nested_flattened=0,
+          malformed_dropped up to 20/row under the old regex-only classifier).
+        * nested arrays — [..., ["agent_reasoning:X"]].
+      Both are invisible to verify_outcome's JSON_CONTAINS on a top-level
       scalar. Phase 1 recursively flattens every fleet_memory.source_refs into
-      a deduped flat list of scalar strings matching ^[a-z_]+:\\d+$, dropping
-      malformed elements. Each row is repaired inside its own transaction with
-      SELECT ... FOR UPDATE.
+      a deduped flat list of scalar strings matching ^[a-z_]+:[A-Za-z0-9._-]+$,
+      RECOVERING stringified layers (parse + recurse to fixpoint) rather than
+      dropping them. An element is counted malformed_dropped only if it is both
+      unparseable as JSON AND fails the ref pattern. Each row is repaired
+      inside its own transaction with SELECT ... FOR UPDATE.
 
   Phase 2 — counter backfill (depends on phase 1)
       Recomputes, per fleet_memory row:
@@ -59,6 +72,7 @@ import pymysql  # noqa: E402
 from tool_handlers import (  # noqa: E402  (after sys.path patch)
     derive_confidence,
     _flatten_source_refs,
+    _flatten_source_refs_with_stats,
     _SOURCE_REF_RE,
     _AGENT_REASONING_REF_RE,
 )
@@ -99,47 +113,79 @@ def _decode(raw):
     return raw
 
 
-def _analyze(decoded):
-    """Diagnostics for a decoded source_refs value.
-
-    Returns (before_count, nested_arrays, malformed_dropped). before_count is
-    the number of top-level elements; nested_arrays counts array nodes below
-    the root; malformed_dropped counts scalar leaves that fail the ref regex.
-    """
+def _before_count(decoded):
+    """Number of top-level elements in a decoded source_refs value."""
     if decoded is None:
-        return 0, 0, 0
+        return 0
     if isinstance(decoded, list):
-        before_count = len(decoded)
+        return len(decoded)
+    return 1
+
+
+def phase0_discover(conn):
+    """Empirically establish the ref grammar (parse, don't regex-guess).
+
+    Scans every ref across fleet_memory.source_refs and
+    agent_reasoning.evidence_refs, recovering stringified layers the same way
+    Phase 1 will, then reports the DISTINCT prefixes/formats present and any
+    value the widened pattern still rejects. Read-only: never writes, runs in
+    both dry-run and apply modes so the grammar is on the record either way.
+    """
+    print("\n=== PHASE 0: ref-grammar discovery (read-only) ===")
+
+    sources = (
+        ("fleet_memory", "source_refs"),
+        ("agent_reasoning", "evidence_refs"),
+    )
+    prefix_counts = {}          # prefix -> count of accepted refs
+    prefix_samples = {}         # prefix -> a sample accepted ref
+    rejected = {}               # raw rejected value -> count
+
+    for table, column in sources:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {column} AS refs FROM {table}")
+            rows = cur.fetchall()
+        for row in rows:
+            flat, stats = _flatten_source_refs_with_stats(_decode(row["refs"]))
+            for ref in flat:
+                prefix = ref.split(":", 1)[0]
+                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+                prefix_samples.setdefault(prefix, ref)
+            for bad in stats["unmatched_formats"]:
+                rejected[bad] = rejected.get(bad, 0) + 1
+
+    print(f"  validation pattern: {_SOURCE_REF_RE.pattern}")
+    if prefix_counts:
+        print("  distinct ref prefixes accepted by the widened pattern:")
+        for prefix in sorted(prefix_counts):
+            print(
+                f"    {prefix:<24} n={prefix_counts[prefix]:<6} "
+                f"e.g. {prefix_samples[prefix]}"
+            )
     else:
-        before_count = 1
-    nested = 0
-    malformed = 0
+        print("  (no accepted refs found)")
 
-    def _walk(v, depth):
-        nonlocal nested, malformed
-        if isinstance(v, list):
-            if depth > 0:
-                nested += 1
-            for item in v:
-                _walk(item, depth + 1)
-        elif isinstance(v, str):
-            if not _SOURCE_REF_RE.match(v):
-                malformed += 1
-        else:
-            malformed += 1
-
-    _walk(decoded, 0)
-    return before_count, nested, malformed
+    if rejected:
+        print(
+            "  !! ref-shaped values REJECTED by the widened pattern "
+            "(NOT dropped silently — widen the grammar if these are real):"
+        )
+        for bad in sorted(rejected, key=lambda k: (-rejected[k], k)):
+            print(f"    n={rejected[bad]:<6} {bad!r}")
+    else:
+        print("  no ref-shaped values were rejected by the widened pattern.")
 
 
 def phase1_flatten(conn, dry_run):
-    """Flatten every fleet_memory.source_refs to a flat deduped scalar list."""
+    """Flatten every fleet_memory.source_refs to a flat deduped scalar list,
+    recovering stringified layers rather than dropping them."""
     print("\n=== PHASE 1: flatten source_refs ===")
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM fleet_memory ORDER BY id")
         ids = [r["id"] for r in cur.fetchall()]
 
     changed = 0
+    tot_recovered = tot_nested = tot_dropped = 0
     for mem_id in ids:
         conn.begin()
         try:
@@ -152,8 +198,8 @@ def phase1_flatten(conn, dry_run):
                 row = cur.fetchone()
                 raw = row["source_refs"] if row else None
                 decoded = _decode(raw)
-                flat = _flatten_source_refs(decoded)
-                before_count, nested, malformed = _analyze(decoded)
+                flat, stats = _flatten_source_refs_with_stats(decoded)
+                before_count = _before_count(decoded)
 
                 # No-op if already flat-and-equal (idempotency). A NULL with
                 # no refs is left NULL rather than rewritten to "[]".
@@ -163,10 +209,20 @@ def phase1_flatten(conn, dry_run):
                     continue
 
                 changed += 1
+                tot_recovered += stats["recovered_from_strings"]
+                tot_nested += stats["nested_flattened"]
+                tot_dropped += stats["malformed_dropped"]
                 print(
                     f"  id={mem_id}: refs {before_count} -> {len(flat)} "
-                    f"(nested_flattened={nested}, malformed_dropped={malformed})"
+                    f"(recovered_from_strings={stats['recovered_from_strings']}, "
+                    f"nested_flattened={stats['nested_flattened']}, "
+                    f"malformed_dropped={stats['malformed_dropped']})"
                 )
+                if stats["unmatched_formats"]:
+                    print(
+                        f"      rejected (not dropped silently): "
+                        f"{stats['unmatched_formats']}"
+                    )
                 if not dry_run:
                     cur.execute(
                         "UPDATE fleet_memory SET source_refs = %s WHERE id = %s",
@@ -178,7 +234,11 @@ def phase1_flatten(conn, dry_run):
         except Exception:
             conn.rollback()
             raise
-    print(f"  phase 1 {'would change' if dry_run else 'changed'} {changed} row(s).")
+    print(
+        f"  phase 1 {'would change' if dry_run else 'changed'} {changed} row(s) "
+        f"— totals: recovered_from_strings={tot_recovered}, "
+        f"nested_flattened={tot_nested}, malformed_dropped={tot_dropped}."
+    )
 
 
 def phase2_backfill(conn, dry_run):
@@ -300,7 +360,10 @@ def main():
 
     conn = _connect()
     try:
+        phase0_discover(conn)
         phase1_flatten(conn, args.dry_run)
+        # Phase 2 MUST run after the improved Phase 1: recovered refs can
+        # change the set of linked checkpoints, hence the verified counters.
         phase2_backfill(conn, args.dry_run)
     finally:
         conn.close()

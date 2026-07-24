@@ -28,8 +28,10 @@ from tool_handlers import (
     _build_hybrid_sql, _build_vector_sql,
     _validate_identifiers, _hybrid_search,
     derive_confidence, _shortcut_eligible, verify_outcome,
-    _build_summary_prompt,
+    _build_summary_prompt, _build_degraded_summary_prompt,
     _flatten_source_refs, _accepted_merge_refs, _run_agent_loop,
+    write_fleet_memory, write_reasoning_checkpoint,
+    _validate_evidence_refs, _stage_routing, _gate_fail_reason,
     SHORTCUT_CONFIDENCE_MIN, SHORTCUT_CONFIRMATIONS_MIN,
 )
 from text_bander import (
@@ -883,6 +885,54 @@ class TestSourceRefsFlattening:
         assert _flatten_source_refs([]) == []
         assert _flatten_source_refs("null") == []
 
+    def test_repair_recovers_stringified_refs(self):
+        # The corruption the cluster-2 dry-run actually found: stringified JSON
+        # arrays as single string elements (not nested Python lists). The old
+        # regex-only classifier dropped these; recovery must parse and keep
+        # them. Also exercises the widened grammar (outage_catalog:E-002).
+        from tool_handlers import _flatten_source_refs_with_stats
+        row = [
+            "agent_reasoning:1",
+            '["agent_reasoning:2"]',
+            '["outage_catalog:E-002"]',
+        ]
+        flat, stats = _flatten_source_refs_with_stats(row)
+        assert flat == [
+            "agent_reasoning:1",
+            "agent_reasoning:2",
+            "outage_catalog:E-002",
+        ]
+        assert stats["malformed_dropped"] == 0
+        assert stats["recovered_from_strings"] == 2
+        assert stats["nested_flattened"] == 0
+        assert stats["unmatched_formats"] == []
+
+    def test_widened_grammar_admits_non_numeric_ids(self):
+        # outage_catalog:E-002-style refs must survive; the pre-v4 numeric-only
+        # regex would have dropped them.
+        assert _flatten_source_refs(["outage_catalog:E-002"]) == [
+            "outage_catalog:E-002"]
+
+    def test_deeply_stringified_layers_unwrap_to_fixpoint(self):
+        # A doubly-stringified layer: '["[\"agent_reasoning:7\"]"]' — the inner
+        # array is itself a stringified array. Recovery recurses until fixpoint.
+        from tool_handlers import _flatten_source_refs_with_stats
+        doubly = json.dumps([json.dumps(["agent_reasoning:7"])])
+        flat, stats = _flatten_source_refs_with_stats([doubly])
+        assert flat == ["agent_reasoning:7"]
+        assert stats["recovered_from_strings"] == 2
+        assert stats["malformed_dropped"] == 0
+
+    def test_unparseable_ref_shaped_string_reported_not_silent(self):
+        # A value that fails the ref pattern AND is not JSON is dropped, but a
+        # ref-shaped one (contains ':') is surfaced in unmatched_formats.
+        from tool_handlers import _flatten_source_refs_with_stats
+        flat, stats = _flatten_source_refs_with_stats(
+            ["agent_reasoning:1", "WEIRD:Format!!"])
+        assert flat == ["agent_reasoning:1"]
+        assert stats["malformed_dropped"] == 1
+        assert "WEIRD:Format!!" in stats["unmatched_formats"]
+
 
 # ============================================================================
 # Provenance-safe merges (Task 3)
@@ -1103,3 +1153,475 @@ class TestAgentLoopStopReason:
         )
         assert degraded is True
         assert reason.startswith("unexpected_stop_reason")
+
+
+# ============================================================================
+# v5 verification linkage — scripted-DB harness
+# ============================================================================
+#
+# A tiny SQL router that dispatches execute() to a handler by substring match,
+# so the pure logic of write_fleet_memory / verify_outcome can be exercised
+# without a live TiDB. First matching route wins; order specific → generic.
+
+class _ScriptCursor:
+    def __init__(self, routes, log):
+        self.routes = routes          # list of (substr, fn(self, params))
+        self.log = log                # shared [(sql, params)]
+        self._rows = []
+        self.rowcount = 0
+        self.lastrowid = None
+
+    def execute(self, sql, params=None):
+        self.log.append((sql, params))
+        self._rows = []
+        self.rowcount = 0
+        for substr, fn in self.routes:
+            if substr in sql:
+                fn(self, params)
+                return
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _ScriptConn:
+    def __init__(self, cur):
+        self._cur = cur
+        self.committed = False
+        self.rolledback = False
+
+    def begin(self):
+        pass
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolledback = True
+
+    def close(self):
+        pass
+
+    def cursor(self):
+        return self._cur
+
+
+class _ScriptDB:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return self._cur
+
+
+def _executed(log, needle):
+    """True if any executed SQL contains needle."""
+    return any(needle in sql for sql, _ in log)
+
+
+def _params_for(log, needle):
+    """Params of the first executed SQL containing needle (or None)."""
+    for sql, params in log:
+        if needle in sql:
+            return params
+    return None
+
+
+class TestPendingRefStamped:
+    """Task 2 / test_pending_ref_stamped_on_write."""
+
+    def _env(self, routes):
+        log = []
+        cur = _ScriptCursor(routes, log)
+        conn = _ScriptConn(cur)
+        db = _ScriptDB(cur)
+        pool = SimpleNamespace(connection=lambda: conn)
+        patches = [
+            patch("tool_handlers.embed", lambda text: [0.0] * 384),
+            patch("tool_handlers.get_db", new=lambda: db),
+            patch("tool_handlers._get_pool", new=lambda: pool),
+        ]
+        return log, cur, conn, patches
+
+    def test_pending_ref_stamped_on_insert(self):
+        routes = [
+            ("AS distance", lambda c, p: setattr(c, "_rows", [])),  # no near-dup
+            ("SELECT id FROM agent_reasoning WHERE session_id",
+             lambda c, p: setattr(c, "_rows", [{"id": 777}])),
+            ("INSERT INTO fleet_memory",
+             lambda c, p: setattr(c, "lastrowid", 1)),
+        ]
+        log, cur, conn, patches = self._env(routes)
+        for pt in patches:
+            pt.start()
+        try:
+            result = json.loads(write_fleet_memory(
+                category="pattern", scope="global",
+                content="contactor weld pattern", source_refs=[],
+                session_id="sess-A",
+            ))
+        finally:
+            for pt in patches:
+                pt.stop()
+
+        assert result["status"] == "created"
+        insert_params = _params_for(log, "INSERT INTO fleet_memory")
+        # pending_refs is the 9th bind (index 8); adjudicated_refs the 10th.
+        pending = json.loads(insert_params[8])
+        adjudicated = json.loads(insert_params[9])
+        assert pending == ["agent_reasoning:777"]
+        assert adjudicated == []
+
+    def test_pending_ref_stamped_on_merge(self):
+        routes = [
+            ("AS distance",
+             lambda c, p: setattr(c, "_rows", [
+                 {"id": 500, "category": "pattern", "distance": 0.05}])),
+            ("SELECT source_refs, confidence, pending_refs",
+             lambda c, p: setattr(c, "_rows", [{
+                 "source_refs": json.dumps(["agent_reasoning:9"]),
+                 "confidence": 0.7, "pending_refs": None}])),
+            ("SELECT resolution FROM agent_reasoning",
+             lambda c, p: setattr(c, "_rows", [{"resolution": "confirmed"}])),
+            ("SELECT id FROM agent_reasoning WHERE session_id",
+             lambda c, p: setattr(c, "_rows", [{"id": 777}])),
+            ("UPDATE fleet_memory", lambda c, p: None),
+        ]
+        log, cur, conn, patches = self._env(routes)
+        for pt in patches:
+            pt.start()
+        try:
+            result = json.loads(write_fleet_memory(
+                category="pattern", scope="global",
+                content="contactor weld pattern",
+                source_refs=["agent_reasoning:42"],
+                session_id="sess-A",
+            ))
+        finally:
+            for pt in patches:
+                pt.stop()
+
+        assert result["status"] == "updated_existing"
+        update_params = _params_for(log, "UPDATE fleet_memory")
+        # merge UPDATE binds: (content, source_refs, pending_refs, vec, id)
+        pending = json.loads(update_params[2])
+        assert "agent_reasoning:777" in pending      # session ref stamped
+        # and it is a flat, deduped scalar list
+        assert all(isinstance(x, str) for x in pending)
+        assert len(pending) == len(set(pending))
+
+
+class _VerifyEnv:
+    """Helper to run verify_outcome against a scripted DB and return
+    (result, log, conn)."""
+
+    @staticmethod
+    def run(checkpoint_row, candidate_rows, reasoning_id, outcome):
+        log = []
+        captured = {}
+
+        def _checkpoint(c, p):
+            c._rows = [checkpoint_row] if checkpoint_row is not None else []
+
+        def _candidates(c, p):
+            c._rows = list(candidate_rows)
+
+        routes = [
+            ("verified_outcome, verified_at", _checkpoint),
+            ("SET verified_outcome", lambda c, p: None),
+            ("JSON_CONTAINS(source_refs", _candidates),
+            ("SET resolution = 'confirmed'", lambda c, p: None),
+            ("SET verified_confirmations", lambda c, p: None),
+        ]
+        cur = _ScriptCursor(routes, log)
+        conn = _ScriptConn(cur)
+        pool = SimpleNamespace(connection=lambda: conn)
+        with patch("tool_handlers._get_pool", new=lambda: pool):
+            result = json.loads(verify_outcome(
+                reasoning_id=reasoning_id, outcome=outcome))
+        return result, log, conn
+
+
+class TestVerifyPromotion:
+    """Task 3 — promotion, idempotency, loud failure."""
+
+    def test_verify_promotes_pending_ref(self):
+        # test_verify_promotes_pending_ref: positive outcome moves ref
+        # pending->source, +1 confirmation, escalated->confirmed, confidence
+        # re-derived.
+        checkpoint = {"verified_outcome": None, "verified_at": None,
+                      "resolution": "escalated"}
+        memory = {"id": 10, "provenance": "session",
+                  "verified_confirmations": 0, "verified_contradictions": 0,
+                  "source_refs": json.dumps([]),
+                  "pending_refs": json.dumps(["agent_reasoning:5"]),
+                  "adjudicated_refs": None}
+        result, log, conn = _VerifyEnv.run(checkpoint, [memory], 5,
+                                           "fixed_as_diagnosed")
+
+        assert result["status"] == "ok"
+        assert result["outcome_action"] == "stamped"
+        assert len(result["touched_memories"]) == 1
+        # Escalated checkpoint flipped to confirmed.
+        assert _executed(log, "SET resolution = 'confirmed'")
+        up = _params_for(log, "SET verified_confirmations")
+        # binds: (vc, vcontra, provenance, confidence, source, pending, adj, id)
+        vc, vcontra, prov, conf = up[0], up[1], up[2], up[3]
+        source = json.loads(up[4])
+        pending = json.loads(up[5])
+        adjudicated = json.loads(up[6])
+        assert vc == 1 and vcontra == 0
+        assert prov == "verified"
+        assert conf == derive_confidence("verified", 1, 0) == 0.75
+        assert "agent_reasoning:5" in source        # moved into source_refs
+        assert "agent_reasoning:5" not in pending    # removed from pending
+        assert any(a["ref"] == "agent_reasoning:5"
+                   and a["outcome"] == "fixed_as_diagnosed"
+                   for a in adjudicated)
+
+    def test_verify_propagates_previously_stamped_outcome(self):
+        # test_verify_propagates_previously_stamped_outcome: a checkpoint with
+        # verified_outcome ALREADY set but never propagated IS delivered to
+        # memory. Guards against the idempotency mechanism blocking the repair.
+        checkpoint = {"verified_outcome": "fixed_as_diagnosed",
+                      "verified_at": "2026-07-01T00:00:00",
+                      "resolution": "escalated"}
+        memory = {"id": 10, "provenance": "session",
+                  "verified_confirmations": 0, "verified_contradictions": 0,
+                  "source_refs": json.dumps([]),
+                  "pending_refs": json.dumps(["agent_reasoning:5"]),
+                  "adjudicated_refs": None}
+        result, log, conn = _VerifyEnv.run(checkpoint, [memory], 5,
+                                           "fixed_as_diagnosed")
+
+        assert result["status"] == "ok"                       # DID propagate
+        assert result["outcome_action"] == "already_stamped_reprop"
+        # NOT re-stamped (outcome already present)...
+        assert not _executed(log, "SET verified_outcome")
+        # ...but the memory WAS updated.
+        assert _executed(log, "SET verified_confirmations")
+        assert len(result["touched_memories"]) == 1
+
+    def test_propagation_idempotent_per_ref(self):
+        # test_propagation_idempotent_per_ref: a ref already in adjudicated_refs
+        # is skipped; the second run is a no-op (no double increment).
+        checkpoint = {"verified_outcome": "fixed_as_diagnosed",
+                      "verified_at": "2026-07-01T00:00:00",
+                      "resolution": "confirmed"}
+        memory = {"id": 10, "provenance": "verified",
+                  "verified_confirmations": 1, "verified_contradictions": 0,
+                  "source_refs": json.dumps(["agent_reasoning:5"]),
+                  "pending_refs": json.dumps([]),
+                  "adjudicated_refs": json.dumps([
+                      {"ref": "agent_reasoning:5",
+                       "outcome": "fixed_as_diagnosed",
+                       "at": "2026-07-01T00:00:00"}])}
+        result, log, conn = _VerifyEnv.run(checkpoint, [memory], 5,
+                                           "fixed_as_diagnosed")
+
+        # No memory UPDATE at all — already counted.
+        assert not _executed(log, "SET verified_confirmations")
+        assert result["status"] == "ok_no_propagation"
+        assert len(result["touched_memories"]) == 0
+        assert len(result["skipped_memories"]) == 1
+
+    def test_outcome_conflict_rejected(self):
+        # test_outcome_conflict_rejected: a second verify with a DIFFERENT
+        # outcome returns outcome_conflict and changes nothing.
+        checkpoint = {"verified_outcome": "different_fault",
+                      "verified_at": "2026-07-01T00:00:00",
+                      "resolution": "escalated"}
+        result, log, conn = _VerifyEnv.run(checkpoint, [], 5,
+                                           "fixed_as_diagnosed")
+
+        assert result["status"] == "outcome_conflict"
+        assert result["existing_outcome"] == "different_fault"
+        assert result["incoming_outcome"] == "fixed_as_diagnosed"
+        # Nothing beyond the checkpoint lookup ran; the txn rolled back.
+        assert not _executed(log, "SET verified_outcome")
+        assert not _executed(log, "JSON_CONTAINS(source_refs")
+        assert conn.rolledback is True
+
+    def test_negative_adjudication_preserves_audit(self):
+        # test_negative_adjudication_preserves_audit: negative outcome records
+        # the ref in adjudicated_refs, +1 contradiction, does NOT add to
+        # source_refs, and does NOT flip the escalated checkpoint.
+        checkpoint = {"verified_outcome": None, "verified_at": None,
+                      "resolution": "escalated"}
+        memory = {"id": 10, "provenance": "verified",
+                  "verified_confirmations": 2, "verified_contradictions": 0,
+                  "source_refs": json.dumps([]),
+                  "pending_refs": json.dumps(["agent_reasoning:5"]),
+                  "adjudicated_refs": None}
+        result, log, conn = _VerifyEnv.run(checkpoint, [memory], 5,
+                                           "different_fault")
+
+        assert result["status"] == "ok"
+        up = _params_for(log, "SET verified_confirmations")
+        vc, vcontra = up[0], up[1]
+        source = json.loads(up[4])
+        adjudicated = json.loads(up[6])
+        assert vcontra == 1                          # contradiction counted
+        assert vc == 2                               # confirmations untouched
+        assert "agent_reasoning:5" not in source     # NOT promoted to evidence
+        assert any(a["ref"] == "agent_reasoning:5"
+                   and a["outcome"] == "different_fault"
+                   for a in adjudicated)             # audit preserved
+        # Negative outcome must NOT flip the escalated checkpoint.
+        assert not _executed(log, "SET resolution = 'confirmed'")
+
+    def test_ok_no_propagation_warns(self):
+        # test_ok_no_propagation_warns: zero memories touched returns
+        # ok_no_propagation with a warning.
+        checkpoint = {"verified_outcome": None, "verified_at": None,
+                      "resolution": "confirmed"}
+        result, log, conn = _VerifyEnv.run(checkpoint, [], 5,
+                                           "fixed_as_diagnosed")
+
+        assert result["status"] == "ok_no_propagation"
+        assert result["touched_memories"] == []
+        assert "warning" in result and result["warning"]
+        # The outcome WAS stamped on the checkpoint even though nothing
+        # propagated (loud, not silent).
+        assert _executed(log, "SET verified_outcome")
+        assert result["outcome_action"] == "stamped"
+
+
+class TestEvidenceRefAllowList:
+    """Task 4 — write-time ref allow-list and quarantine."""
+
+    class _NoSQLCursor:
+        """Raises if any SQL runs — proves unknown prefixes are rejected
+        BEFORE any query is constructed."""
+        def execute(self, *a, **k):
+            raise AssertionError("no SQL should run for an unknown prefix")
+
+        def fetchall(self):
+            raise AssertionError("no SQL should run for an unknown prefix")
+
+    def test_ref_prefix_not_in_allowlist_quarantined(self):
+        cur = self._NoSQLCursor()
+        valid, quarantined = _validate_evidence_refs(cur, ["users:1"])
+        assert valid == []
+        assert quarantined == [{"ref": "users:1", "reason": "unknown_prefix"}]
+
+    def test_known_prefix_existence_checked_and_quarantined(self):
+        # agent_reasoning:1 exists, agent_reasoning:2 does not; a malformed ref
+        # is quarantined without SQL. Confirms batched existence check + the
+        # not_found / malformed reasons.
+        log = []
+
+        def _existence(c, p):
+            # Only id 1 exists.
+            c._rows = [{"pk": 1}]
+
+        routes = [("FROM agent_reasoning", _existence)]
+        cur = _ScriptCursor(routes, log)
+        valid, quarantined = _validate_evidence_refs(
+            cur, ["agent_reasoning:1", "agent_reasoning:2", "not-a-ref"])
+        assert valid == ["agent_reasoning:1"]
+        reasons = {q["ref"]: q["reason"] for q in quarantined}
+        assert reasons["agent_reasoning:2"] == "not_found"
+        assert reasons["not-a-ref"] == "malformed"
+
+    def test_outage_catalog_uses_pattern_id(self):
+        # outage_catalog:E-002 must be checked against pattern_id, not the
+        # AUTO_RANDOM id.
+        seen = {}
+
+        def _existence(c, p):
+            seen["params"] = p
+            c._rows = [{"pk": "E-002"}]
+
+        routes = [("FROM outage_catalog", _existence)]
+        cur = _ScriptCursor(routes, [])
+        valid, quarantined = _validate_evidence_refs(cur, ["outage_catalog:E-002"])
+        assert valid == ["outage_catalog:E-002"]
+        assert quarantined == []
+        assert seen["params"] == ["E-002"]
+
+
+class TestRoutingStages:
+    """Task 5 — test_routing_log_stages: staged counts distinguish empty-fleet
+    from gated."""
+
+    def _match(self, **kw):
+        base = {"id": 1, "confidence": 0.90, "similarity": 0.70,
+                "verified_confirmations": 5, "superseded_by": None}
+        base.update(kw)
+        return base
+
+    def test_empty_fleet(self):
+        staged = _stage_routing([])
+        assert staged["candidates"] == 0
+        assert staged["similar"] == 0
+        assert staged["eligible"] == 0
+        assert staged["top_candidate"] is None
+        assert staged["gate_fail_reason"] is None
+
+    def test_similar_but_gated(self):
+        # A populated fleet where the (single) candidate is similar but has no
+        # field confirmations: candidates>0 distinguishes it from empty-fleet,
+        # eligible=0 shows it was gated, and gate_fail_reason names why.
+        gated = self._match(verified_confirmations=0)
+        staged = _stage_routing([gated])
+        assert staged["candidates"] == 1
+        assert staged["similar"] == 1            # cleared the similarity floor
+        assert staged["eligible"] == 0           # but gated
+        assert staged["gate_fail_reason"] == "verified_confirmations<3"
+
+    def test_eligible_candidate(self):
+        staged = _stage_routing([self._match()])
+        assert staged["eligible"] == 1
+        assert staged["gate_fail_reason"] is None
+
+    def test_gate_fail_reason_matches_clause_order(self):
+        # superseded short-circuits before the numeric clauses.
+        assert _gate_fail_reason(self._match(superseded_by=9)) == "superseded"
+        assert _gate_fail_reason(
+            self._match(confidence=0.5)) == "confidence<0.85"
+
+
+class TestSummaryHedging:
+    """Task 6 — anti-fabrication + confidence-calibrated hedging."""
+
+    def _checkpoint(self, confidence):
+        return {"id": 42, "observation": "voltage sag under load",
+                "hypothesis": "cable resistance degradation",
+                "confidence": confidence, "resolution": "confirmed",
+                "evidence_refs": json.dumps(["charger_windows:1"])}
+
+    def test_low_confidence_recommends_inspection(self):
+        prompt = _build_summary_prompt(self._checkpoint(0.55), "CP-1", "alert")
+        assert "inspection" in prompt.lower()
+        assert "do not" in prompt.lower() or "not issue" in prompt.lower()
+        # Anti-fabrication clause present.
+        assert "traceable" in prompt.lower()
+        assert "state its absence" in prompt.lower()
+
+    def test_high_confidence_allows_remediation(self):
+        prompt = _build_summary_prompt(self._checkpoint(0.90), "CP-1", "alert")
+        assert "remediation recommendation is" in prompt.lower()
+        assert "traceable" in prompt.lower()
+
+    def test_degraded_prompt_is_anti_fabrication(self):
+        prompt = _build_degraded_summary_prompt(
+            None, "CP-1", "alert", "refusal")
+        assert "traceable" in prompt.lower()
+        assert "state its absence" in prompt.lower()
+        assert "never a definitive remediation" in prompt.lower()

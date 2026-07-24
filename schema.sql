@@ -14,7 +14,12 @@
 --
 -- Includes: FULLTEXT indexes, anomaly_breakdown, supersession tracking (v2);
 --   derived-confidence columns for decision-grade confidence (v3 — see the
---   per-column comments in fleet_memory and agent_reasoning below).
+--   per-column comments in fleet_memory and agent_reasoning below); the v4
+--   verified/agent-authored counter split (verified_confirmations,
+--   verified_contradictions, corroborations, supersede_events); and the v5
+--   explicit verification-linkage columns (pending_refs, adjudicated_refs).
+--   A fresh install of schema.sql therefore matches a cluster migrated through
+--   schema_v3 → schema_v4 → schema_v5.
 -- ============================================================================
 
 -- ============================================================================
@@ -173,8 +178,28 @@ CREATE TABLE IF NOT EXISTS fleet_memory (
   model_confidence DECIMAL(3,2) NULL          COMMENT 'Model self-report, telemetry only — never used in decisions',
   provenance ENUM('session','consolidated','verified') NOT NULL DEFAULT 'session',
   supporting_evidence_count INT DEFAULT 1,
+  -- Pre-v4 counters, RETAINED as frozen history. No decision path reads them
+  -- after v4 (their values were preserved into corroborations/supersede_events
+  -- by the v4 repair backfill). Kept so migrated clusters and fresh installs
+  -- have identical columns.
   confirmations   INT           NOT NULL DEFAULT 0,
   contradictions  INT           NOT NULL DEFAULT 0,
+  -- v4: split field-verified counters from agent-authored churn (see
+  -- migrations/schema_v4_counter_split.sql). Only verify_outcome (field ground
+  -- truth) writes verified_*; those gate the shortcut and feed the Beta
+  -- posterior. corroborations/supersede_events carry agent/consolidation/merge
+  -- churn and are informational only (never gate, never feed the posterior).
+  verified_confirmations  INT   NOT NULL DEFAULT 0 COMMENT 'v4: field-verified confirmations (verify_outcome only). Gates shortcut.',
+  verified_contradictions INT   NOT NULL DEFAULT 0 COMMENT 'v4: field-verified contradictions (verify_outcome only). Feeds posterior.',
+  corroborations  INT           NOT NULL DEFAULT 0 COMMENT 'v4: agent/consolidation/merge corroboration. Informational, does NOT gate shortcut.',
+  supersede_events INT          NOT NULL DEFAULT 0 COMMENT 'v4: agent-authored supersede/churn events. Informational, does NOT feed posterior.',
+  -- v5: explicit checkpoint→memory verification linkage (see
+  -- migrations/schema_v5_verification_link.sql). pending_refs is the
+  -- platform-stamped linkage record (never evidence, never assembled into
+  -- context); adjudicated_refs is the per-ref propagation idempotency record +
+  -- audit trail written by verify_outcome.
+  pending_refs    JSON                        COMMENT 'v5: checkpoint refs awaiting field adjudication. Platform-stamped, never model-supplied. Never evidence, never fed to context assembly.',
+  adjudicated_refs JSON                        COMMENT 'v5: refs whose field outcome has been COUNTED against this memory: [{ref, outcome, at}]. Idempotency record + audit trail for every counter movement.',
   access_count    INT           DEFAULT 0,
   last_accessed   TIMESTAMP     NULL,
   last_decayed_at TIMESTAMP     NULL          COMMENT 'v3: dedicated decay clock so confidence decay no longer piggybacks on updated_at',

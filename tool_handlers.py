@@ -469,31 +469,64 @@ def derive_confidence(provenance: str, confirmations: int,
 # ============================================================================
 #
 # Invariant: every element of fleet_memory.source_refs is a scalar string
-# matching ^[a-z_]+:\d+$ (e.g. "agent_reasoning:48291"). NEVER a nested array.
+# matching ^[a-z_]+:[A-Za-z0-9._-]+$ (e.g. "agent_reasoning:48291",
+# "outage_catalog:E-002"). NEVER a nested array, NEVER a stringified array.
 #
-# The pre-v4 merge path appended json.dumps(list) as a single element via
-# JSON_ARRAY_APPEND, producing [..., ["agent_reasoning:X"]]. verify_outcome's
-# JSON_CONTAINS(source_refs, '"agent_reasoning:X"') matches only top-level
-# scalars, so nested refs were unreachable and their field verifications never
-# propagated. These helpers enforce the flat-scalar invariant on write and in
-# the repair script.
+# Two distinct pre-v4 corruptions produced non-scalar elements:
+#   * nested arrays — an early merge appended a Python list, giving
+#     [..., ["agent_reasoning:X"]].
+#   * stringified arrays — the merge path appended json.dumps(list) as a
+#     single element, giving [..., '["agent_reasoning:X"]'] (a *string* whose
+#     text is a JSON array). This is what the cluster-2 dry-run actually found.
+# In both cases verify_outcome's JSON_CONTAINS(source_refs, '"..:X"') matches
+# only top-level scalars, so the buried refs were unreachable and their field
+# verifications never propagated. The flattener below recovers refs from BOTH
+# shapes — parsing stringified layers and recursing to fixpoint — so neither
+# the runtime writer nor the repair script ever discards a recoverable ref.
+#
+# The ref grammar was widened from the original ^[a-z_]+:\d+$ (numeric-only
+# id) to admit non-numeric ids such as outage_catalog:E-002. Anything the
+# widened pattern still rejects is reported (never silently dropped) so the
+# grammar can be widened again if reality demands it.
 
-_SOURCE_REF_RE = re.compile(r"^[a-z_]+:\d+$")
+_SOURCE_REF_RE = re.compile(r"^[a-z_]+:[A-Za-z0-9._-]+$")
 _AGENT_REASONING_REF_RE = re.compile(r"^agent_reasoning:(\d+)$")
 # A merge may only import refs from checkpoints that are confirmed or promoted.
 _MERGEABLE_RESOLUTIONS = ("confirmed", "promoted")
 
 
-def _flatten_source_refs(value) -> list[str]:
-    """Recursively flatten a possibly-nested source_refs value into a deduped
-    flat list of scalar ref strings matching ^[a-z_]+:\\d+$.
+def _flatten_source_refs_with_stats(value):
+    """Core flattener + diagnostics. Returns ``(flat_refs, stats)``.
+
+    ``flat_refs`` is a deduped, order-preserving list of scalar ref strings
+    matching ``_SOURCE_REF_RE``. ``stats`` is a dict:
+
+        recovered_from_strings : count of string elements that were themselves
+                                 JSON (a stringified array/object layer) and
+                                 successfully parsed, then recursed. This is
+                                 the pre-v4 JSON_ARRAY_APPEND corruption.
+        nested_flattened       : count of genuine (in-place, not
+                                 string-derived) array/object nodes below the
+                                 root that were flattened.
+        malformed_dropped      : count of leaves that are neither a valid ref,
+                                 nor parseable as a JSON layer.
+        unmatched_formats      : the raw values of ref-shaped leaves (contain
+                                 ':') that the widened pattern still rejected.
+                                 Reported so grammar drift is visible, never
+                                 silently dropped.
 
     Accepts None, a JSON-encoded string, a bare scalar, or an arbitrarily
-    nested list. Malformed elements (anything not matching the ref regex) are
-    dropped. Order is preserved; the first occurrence of each ref wins.
+    nested list — including string elements that are themselves JSON arrays
+    (recovered by parsing and recursing until fixpoint).
     """
+    stats = {
+        "recovered_from_strings": 0,
+        "nested_flattened": 0,
+        "malformed_dropped": 0,
+        "unmatched_formats": [],
+    }
     if value is None:
-        return []
+        return [], stats
     if isinstance(value, (bytes, bytearray)):
         value = value.decode("utf-8", "ignore")
     if isinstance(value, str):
@@ -505,17 +538,62 @@ def _flatten_source_refs(value) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
 
-    def _walk(v):
-        if isinstance(v, list):
-            for item in v:
-                _walk(item)
-        elif isinstance(v, str) and _SOURCE_REF_RE.match(v):
-            if v not in seen:
-                seen.add(v)
-                out.append(v)
+    def _walk_children(container, depth):
+        if isinstance(container, dict):
+            for item in container.values():
+                _walk(item, depth)
+        else:
+            for item in container:
+                _walk(item, depth)
 
-    _walk(value)
-    return out
+    def _walk(v, depth):
+        if isinstance(v, (list, dict)):
+            if depth > 0:
+                stats["nested_flattened"] += 1
+            _walk_children(v, depth + 1)
+        elif isinstance(v, str):
+            s = v.strip()
+            if _SOURCE_REF_RE.match(s):
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            elif s[:1] in ("[", "{"):
+                # A stringified JSON layer (pre-v4 JSON_ARRAY_APPEND wrote
+                # json.dumps(list) as one element). Parse and recurse to
+                # fixpoint — nested stringified layers unwrap one per level.
+                # Its container is NOT counted as nested_flattened: its
+                # provenance is a stringified layer, tracked separately.
+                try:
+                    parsed = json.loads(s)
+                except (json.JSONDecodeError, ValueError):
+                    stats["malformed_dropped"] += 1
+                    stats["unmatched_formats"].append(v)
+                    return
+                stats["recovered_from_strings"] += 1
+                if isinstance(parsed, (list, dict)):
+                    _walk_children(parsed, depth)
+                else:
+                    _walk(parsed, depth)
+            else:
+                stats["malformed_dropped"] += 1
+                if ":" in s:
+                    stats["unmatched_formats"].append(v)
+        else:
+            stats["malformed_dropped"] += 1
+
+    _walk(value, 0)
+    return out, stats
+
+
+def _flatten_source_refs(value) -> list[str]:
+    """Recursively flatten a possibly-nested/stringified source_refs value into
+    a deduped flat list of scalar ref strings matching ``_SOURCE_REF_RE``.
+
+    Order is preserved; the first occurrence of each ref wins. See
+    :func:`_flatten_source_refs_with_stats` for the recovery semantics —
+    stringified array layers are parsed and recovered, never dropped.
+    """
+    return _flatten_source_refs_with_stats(value)[0]
 
 
 def _accepted_merge_refs(cur, refs) -> list[str]:
@@ -546,6 +624,35 @@ def _accepted_merge_refs(cur, refs) -> list[str]:
                 continue
         accepted.append(ref)
     return accepted
+
+
+def _session_checkpoint_ref(cur, session_id: Optional[str]) -> Optional[str]:
+    """Resolve the CURRENT session's checkpoint ref for pending_refs stamping
+    (v5).
+
+    fleet_memory has no session column and session_state has no back-reference,
+    so the checkpoint→memory link cannot be derived after the fact — it must be
+    stamped explicitly at write time. This returns ``agent_reasoning:{id}`` for
+    the newest checkpoint the session has written, or ``None`` if the session
+    has no checkpoint yet (or no session_id was supplied).
+
+    Deliberately resolution-agnostic: it returns the ref even for an escalated
+    checkpoint. pending_refs is a LINKAGE record, not an evidence claim, so the
+    provenance filter that guards source_refs (``_accepted_merge_refs``) does
+    NOT apply here. That filter locking verified escalations out of memory is
+    exactly the severed loop v5 repairs.
+    """
+    if not session_id:
+        return None
+    cur.execute(
+        "SELECT id FROM agent_reasoning WHERE session_id = %s "
+        "ORDER BY created_at DESC LIMIT 1",
+        (session_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return f"agent_reasoning:{row['id']}"
 
 
 # ============================================================================
@@ -664,6 +771,97 @@ def search_prior_diagnoses(observation_text: str,
     })
 
 
+# ============================================================================
+# EVIDENCE-REF INTEGRITY  (v5, Task 4)
+# ============================================================================
+#
+# Production contains fabricated evidence refs: a report cited
+# "charger_windows:recent_anomalies_2026-05-06T12:10" — no such row — and the
+# fabrication then persisted into diagnosis history and was re-asserted by a
+# later cold run. We validate model-supplied evidence_refs at the WRITE path.
+#
+# SECURITY INVARIANT: a model-supplied prefix must NEVER choose which table is
+# queried. The prefix→(table, pk_column) mapping below is a fixed, module-level
+# allow-list derived from the schema. Any ref whose prefix is not a key here is
+# rejected BEFORE any SQL is constructed. Table/pk names interpolated into SQL
+# come only from this trusted dict; ref VALUES are always parameterized.
+#
+# The real prefix set observed in production is charger_windows, agent_reasoning,
+# outage_catalog, fleet_memory, and prior_diagnosis. Two are non-obvious:
+#   * outage_catalog refs are pattern_id (e.g. "E-002"), NOT the AUTO_RANDOM
+#     `id` — outage_catalog:E-002 would never match `id`.
+#   * prior_diagnosis:{id} is an agent_reasoning row: search_prior_diagnoses
+#     selects ar.id and assemble_context emits `prior_diagnosis:{ar.id}` as a
+#     source. So prior_diagnosis maps to (agent_reasoning, id) — mapped
+#     explicitly rather than silently omitted.
+#
+# TOCTOU: a ref valid at write may be gone by read time (row deleted/superseded).
+# That gap is ACCEPTED — we validate existence at write only; re-validating at
+# every read would be prohibitively expensive and still racy.
+_REF_PREFIX_TABLE: dict[str, tuple[str, str]] = {
+    "charger_windows": ("charger_windows", "id"),
+    "agent_reasoning": ("agent_reasoning", "id"),
+    "outage_catalog":  ("outage_catalog", "pattern_id"),
+    "fleet_memory":    ("fleet_memory", "id"),
+    "prior_diagnosis": ("agent_reasoning", "id"),
+}
+
+
+def _validate_evidence_refs(cur, refs) -> tuple[list, list]:
+    """Validate model-supplied evidence_refs against the fixed prefix
+    allow-list, then batch-check existence per table.
+
+    Returns ``(valid_refs, quarantined)`` where ``quarantined`` is a list of
+    ``{"ref": <value>, "reason": ...}`` dicts (never dropped silently — the
+    caller surfaces them so the model can self-correct next turn). Reasons:
+        "malformed"       — not a scalar ``prefix:value`` ref string.
+        "unknown_prefix"  — prefix not in the allow-list (rejected BEFORE SQL).
+        "not_found"       — well-formed, known prefix, but no such row.
+
+    Unknown-prefix and malformed refs are rejected WITHOUT any SQL. Only
+    known-prefix refs trigger the batched existence checks (one query per
+    distinct (table, pk)).
+    """
+    valid: list = []
+    quarantined: list = []
+    # prefix-grouped, well-formed refs pending an existence check:
+    #   {(table, pk): [(ref_string, pk_value), ...]}
+    by_table: dict[tuple[str, str], list[tuple[str, str]]] = {}
+
+    for raw in (refs or []):
+        if not isinstance(raw, str) or not _SOURCE_REF_RE.match(raw):
+            quarantined.append({"ref": raw, "reason": "malformed"})
+            continue
+        prefix, value = raw.split(":", 1)
+        mapping = _REF_PREFIX_TABLE.get(prefix)
+        if mapping is None:
+            # Rejected BEFORE any SQL — the model-supplied prefix never selects
+            # a table.
+            quarantined.append({"ref": raw, "reason": "unknown_prefix"})
+            continue
+        by_table.setdefault(mapping, []).append((raw, value))
+
+    for (table, pk), group in by_table.items():
+        values = [v for (_ref, v) in group]
+        placeholders = ",".join(["%s"] * len(values))
+        # table/pk come only from the trusted _REF_PREFIX_TABLE; values are
+        # parameterized. Compare as strings so a VARCHAR pk (pattern_id) and a
+        # BIGINT pk (id) are both handled without type-coercion surprises.
+        cur.execute(
+            f"SELECT {pk} AS pk FROM {table} WHERE {pk} IN ({placeholders})",
+            values,
+        )
+        found = {str(r["pk"]) for r in cur.fetchall()}
+        for ref_str, value in group:
+            if value in found:
+                valid.append(ref_str)
+            else:
+                quarantined.append({"ref": ref_str, "reason": "not_found"})
+
+    # Dedupe valid refs, order-preserving (they are already grammar-checked).
+    return _flatten_source_refs(valid), quarantined
+
+
 @_safe_handler
 def write_reasoning_checkpoint(session_id: str, charger_id: str,
                                 observation: str,
@@ -675,7 +873,17 @@ def write_reasoning_checkpoint(session_id: str, charger_id: str,
                                 tags: Optional[list] = None) -> str:
     """Write a reasoning checkpoint to agent_reasoning.
     If this contradicts a prior diagnosis for the same charger, mark
-    the prior one as superseded."""
+    the prior one as superseded.
+
+    v5 (Task 4): model-supplied evidence_refs are validated against a fixed
+    prefix allow-list and batch existence-checked. Refs with an unknown prefix
+    (rejected before any SQL) or pointing at no row are QUARANTINED — never
+    persisted, never dropped silently — and returned in `quarantined_refs` with
+    a structured reason so the model can self-correct next turn. Only validated
+    refs land in the stored evidence_refs. This is what stops model-fabricated
+    evidence (e.g. charger_windows:recent_anomalies_...) from persisting into
+    diagnosis history and being re-asserted by a later cold run.
+    """
     # The model's self-reported `confidence` is telemetry only: it lands in
     # model_confidence, while the decision-grade `confidence` column is
     # derived by the platform. A brand-new checkpoint has no corroboration
@@ -683,6 +891,16 @@ def write_reasoning_checkpoint(session_id: str, charger_id: str,
     derived_confidence = derive_confidence("session", 0, 0)
     with get_db() as db:
         with db.cursor() as cur:
+            # Validate BEFORE the insert so only real refs are persisted.
+            valid_refs, quarantined_refs = _validate_evidence_refs(
+                cur, evidence_refs
+            )
+            if quarantined_refs:
+                log.warning(
+                    "write_reasoning_checkpoint: quarantined %d evidence ref(s) "
+                    "for charger %s: %s",
+                    len(quarantined_refs), charger_id, quarantined_refs,
+                )
             # Insert the new reasoning
             cur.execute("""
                 INSERT INTO agent_reasoning
@@ -691,7 +909,7 @@ def write_reasoning_checkpoint(session_id: str, charger_id: str,
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 charger_id, site_id, session_id, observation, hypothesis,
-                json.dumps(evidence_refs or []),
+                json.dumps(valid_refs),
                 derived_confidence, confidence, resolution,
                 json.dumps(tags or []),
             ))
@@ -712,14 +930,27 @@ def write_reasoning_checkpoint(session_id: str, charger_id: str,
                 """, (new_id, charger_id, new_id))
                 superseded_count = cur.rowcount
 
-    return to_json({
+    result = {
         "status": "ok",
         "reasoning_id": new_id,
         "superseded_count": superseded_count,
         "message": f"Checkpoint saved for {charger_id}."
                    + (f" Superseded {superseded_count} prior diagnosis(es)."
                       if superseded_count > 0 else ""),
-    })
+    }
+    if quarantined_refs:
+        # Surface rejected refs so the model can self-correct next turn
+        # (mirrors the retryable-error note pattern). The checkpoint is still
+        # saved with only the validated refs — the observation/hypothesis are
+        # worth keeping — but the fabricated refs are flagged, never stored.
+        result["quarantined_refs"] = quarantined_refs
+        result["retryable"] = True
+        result["message"] += (
+            f" WARNING: {len(quarantined_refs)} evidence ref(s) were "
+            "quarantined (unknown prefix or no such row) and NOT stored; "
+            "re-cite only real refs."
+        )
+    return to_json(result)
 
 
 @_safe_handler
@@ -739,6 +970,13 @@ def recall_fleet_memory(query_text: str,
             # is a single-table query, so the alias bought nothing and was
             # an unverified guess inside FTS_MATCH_WORD. Bare names remove
             # that empirical unknown.
+            # Candidate query keeps ONLY the cheap structural filters (status
+            # active, memory_vec present, scope/category). Do NOT add a
+            # confidence >= SHORTCUT_CONFIDENCE_MIN prefilter here (Task 5):
+            # shortcut eligibility is adjudicated in Python (_shortcut_eligible
+            # / _stage_routing) so the gate is observable — a prefilter would
+            # make "no similar memories" indistinguishable from "similar
+            # memories, all gated," and hide the nearest miss.
             where_clauses = ["status = 'active'", "memory_vec IS NOT NULL"]
             params = []
 
@@ -799,7 +1037,8 @@ def write_fleet_memory(category: str, scope: str, content: str,
                        source_refs: Optional[list] = None,
                        confidence: float = 0.7,
                        provenance: str = "session",
-                       corroborations: int = 0) -> str:
+                       corroborations: int = 0,
+                       session_id: Optional[str] = None) -> str:
     """Write or merge a fleet memory record.
 
     UPGRADE: Now checks for semantic contradictions within the same scope
@@ -818,6 +1057,18 @@ def write_fleet_memory(category: str, scope: str, content: str,
     are internal knobs (consolidation writes 'consolidated' with
     corroborations=len(group)); the agent-facing tool never sets them and
     gets the 'session'/0 defaults.
+
+    v5 verification linkage: when `session_id` is supplied, the platform stamps
+    the session's current checkpoint ref (agent_reasoning:{id}) into
+    `pending_refs` in BOTH the merge and insert paths, ALWAYS, regardless of
+    the checkpoint's resolution. `session_id` is injected by handle_tool_call
+    from the running investigation — it is NOT a model-supplied field.
+    pending_refs is a LINKAGE record, never evidence: it is never counted, never
+    fed to derive_confidence(), never assembled into context, never shown to the
+    model. It exists only so a later verify_outcome can find this memory to
+    propagate a field outcome to. It follows the source_refs invariants (flat
+    scalar strings, deduped) and is written inside the same FOR UPDATE
+    transaction as source_refs.
     """
     vec = embed(content)
 
@@ -849,10 +1100,10 @@ def write_fleet_memory(category: str, scope: str, content: str,
         try:
             db_conn.begin()
             with db_conn.cursor() as cur:
-                # Lock the target row BEFORE reading source_refs.
+                # Lock the target row BEFORE reading source_refs / pending_refs.
                 cur.execute(
-                    "SELECT source_refs, confidence FROM fleet_memory "
-                    "WHERE id = %s FOR UPDATE",
+                    "SELECT source_refs, confidence, pending_refs "
+                    "FROM fleet_memory WHERE id = %s FOR UPDATE",
                     (target_id,),
                 )
                 locked = cur.fetchone()
@@ -863,15 +1114,27 @@ def write_fleet_memory(category: str, scope: str, content: str,
                 # refs may be imported (Task 3). Flat scalar strings only.
                 incoming = _accepted_merge_refs(cur, source_refs or [])
                 merged_refs = _flatten_source_refs(existing_refs + incoming)
+                # v5: stamp the session's checkpoint ref into pending_refs
+                # (linkage record, NOT evidence — bypasses the provenance
+                # filter above by design). Flat, deduped, same transaction.
+                existing_pending = _flatten_source_refs(
+                    locked.get("pending_refs") if locked else None
+                )
+                link_ref = _session_checkpoint_ref(cur, session_id)
+                merged_pending = _flatten_source_refs(
+                    existing_pending + ([link_ref] if link_ref else [])
+                )
                 cur.execute("""
                     UPDATE fleet_memory
                     SET content = %s,
                         corroborations = corroborations + 1,
                         supporting_evidence_count = supporting_evidence_count + 1,
                         source_refs = %s,
+                        pending_refs = %s,
                         memory_vec = %s
                     WHERE id = %s
-                """, (content, json.dumps(merged_refs), str(vec), target_id))
+                """, (content, json.dumps(merged_refs),
+                      json.dumps(merged_pending), str(vec), target_id))
             db_conn.commit()
         except Exception:
             db_conn.rollback()
@@ -898,16 +1161,23 @@ def write_fleet_memory(category: str, scope: str, content: str,
     try:
         db_conn.begin()
         with db_conn.cursor() as cur:
+            # v5: stamp the session's checkpoint ref into pending_refs on
+            # insert too (linkage record, never evidence). A brand-new memory
+            # has no adjudicated refs yet, so adjudicated_refs starts empty.
+            link_ref = _session_checkpoint_ref(cur, session_id)
+            pending_refs = _flatten_source_refs([link_ref] if link_ref else [])
             cur.execute("""
                 INSERT INTO fleet_memory
                     (category, scope, content, source_refs, confidence,
                      model_confidence, provenance,
                      verified_confirmations, verified_contradictions,
-                     corroborations, supersede_events, memory_vec)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, %s, 0, %s)
+                     corroborations, supersede_events,
+                     pending_refs, adjudicated_refs, memory_vec)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, %s, 0, %s, %s, %s)
             """, (category, scope, content,
                   json.dumps(_flatten_source_refs(source_refs)),
                   derived_confidence, confidence, provenance, corroborations,
+                  json.dumps(pending_refs), json.dumps([]),
                   str(vec)))
             memory_id = cur.lastrowid
 
@@ -947,6 +1217,35 @@ _VERIFY_OUTCOMES = frozenset({
 })
 
 
+def _parse_adjudicated(value) -> list[dict]:
+    """Parse fleet_memory.adjudicated_refs into a list of ``{ref, outcome, at}``
+    dicts. Accepts None, a JSON string (DictCursor returns JSON columns as
+    strings), or an already-decoded list. Non-dict / malformed elements are
+    dropped defensively — the audit trail is append-only in normal operation,
+    but we never let a corrupted row crash a verification.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "ignore")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    return [e for e in value if isinstance(e, dict) and "ref" in e]
+
+
+def _adjudicated_has_ref(adjudicated: list[dict], ref: str) -> bool:
+    """True if ``ref`` has already been counted against this memory (present in
+    adjudicated_refs regardless of the recorded outcome). This is the per-memory
+    /per-ref propagation idempotency check — deliberately independent of the
+    checkpoint-level verified_outcome state (see verify_outcome)."""
+    return any(e.get("ref") == ref for e in adjudicated)
+
+
 @_safe_handler
 def verify_outcome(reasoning_id: int, outcome: str,
                    notes: Optional[str] = None) -> str:
@@ -960,19 +1259,44 @@ def verify_outcome(reasoning_id: int, outcome: str,
     refactor removes. Outcomes arrive from a human field tech via
     agent/verify_outcome.py.
 
-    Effects (single transaction):
-      * agent_reasoning[reasoning_id].verified_outcome / verified_at set.
-      * Every ACTIVE fleet_memory whose source_refs contains
-        "agent_reasoning:{reasoning_id}":
-          - fixed_as_diagnosed  -> verified_confirmations += 1, and provenance
-            promoted session -> verified
-          - different_fault / no_fault_found -> verified_contradictions += 1
-        then confidence re-derived via derive_confidence().
+    TWO INDEPENDENT IDEMPOTENCY MECHANISMS (v5). Conflating them is what
+    severs the loop, so they are kept strictly separate:
 
-    v4: this is the ONLY code path that writes verified_confirmations or
+      1. OUTCOME STATE (checkpoint level — agent_reasoning.verified_outcome):
+           * unset            -> stamp it.
+           * set & identical  -> do NOT re-stamp, but CONTINUE to propagation.
+             A previously stamped outcome that never propagated (the observed
+             orphan bug: outcome on the checkpoint, touched_memories=[]) must
+             still be delivered to memory. A naive "reject if already verified"
+             guard would block the repair AND report success — the exact
+             failure this rewrite exists to fix.
+           * set & different  -> return status: outcome_conflict, echo both
+             outcomes + verified_at, change NOTHING.
+
+      2. PROPAGATION STATE (per memory, per ref — fleet_memory.adjudicated_refs):
+         For each ACTIVE memory whose pending_refs OR source_refs contains the
+         checkpoint ref:
+           * ref already in adjudicated_refs -> skip entirely (already counted).
+           * else, in one FOR UPDATE transaction:
+               - append {ref, outcome, at} to adjudicated_refs;
+               - fixed_as_diagnosed: MOVE ref pending_refs -> source_refs,
+                 verified_confirmations += 1, provenance session -> verified,
+                 and if the checkpoint resolution is escalated flip it to
+                 confirmed;
+               - different_fault / no_fault_found: REMOVE ref from pending_refs
+                 (never lose it — it is preserved in adjudicated_refs),
+                 verified_contradictions += 1, leave the checkpoint escalated;
+               - re-derive confidence via derive_confidence().
+
+    v4/v5: this is the ONLY code path that writes verified_confirmations or
     verified_contradictions. Agent-authored merges/supersedes land in the
-    informational corroborations/supersede_events columns and are invisible
-    to the posterior — field ground truth is the sole input here.
+    informational corroborations/supersede_events columns and are invisible to
+    the posterior — field ground truth is the sole input here.
+
+    LOUD FAILURE: if propagation touches zero memories, return
+    status: ok_no_propagation with a `warning` explaining the outcome was
+    recorded on the checkpoint but reached no fleet memories. status: ok is
+    reserved for actual propagation (>=1 memory counted this call).
     """
     if outcome not in _VERIFY_OUTCOMES:
         # Validate before any DB access.
@@ -985,17 +1309,20 @@ def verify_outcome(reasoning_id: int, outcome: str,
 
     is_confirmation = outcome == "fixed_as_diagnosed"
     ref = f"agent_reasoning:{reasoning_id}"
+    adjudicated_at = datetime.now().isoformat(timespec="seconds")
 
     db_conn = _get_pool().connection()
     try:
         db_conn.begin()
         with db_conn.cursor() as cur:
-            cur.execute("""
-                UPDATE agent_reasoning
-                SET verified_outcome = %s, verified_at = NOW()
-                WHERE id = %s
-            """, (outcome, reasoning_id))
-            if cur.rowcount == 0:
+            # --- Mechanism 1: outcome state (checkpoint level) ---
+            cur.execute(
+                "SELECT verified_outcome, verified_at, resolution "
+                "FROM agent_reasoning WHERE id = %s FOR UPDATE",
+                (reasoning_id,),
+            )
+            checkpoint = cur.fetchone()
+            if checkpoint is None:
                 db_conn.rollback()
                 return to_json({
                     "error": f"No agent_reasoning row with id {reasoning_id}.",
@@ -1003,29 +1330,106 @@ def verify_outcome(reasoning_id: int, outcome: str,
                     "retryable": False,
                 })
 
-            # Fleet memories built from this reasoning chain. Post-v4-repair
-            # source_refs are flat scalars, so JSON_CONTAINS on the top-level
-            # scalar ref reaches every linked memory.
+            existing_outcome = checkpoint.get("verified_outcome")
+            cp_resolution = checkpoint.get("resolution")
+
+            if existing_outcome is not None and existing_outcome != outcome:
+                # Different field outcome already recorded — never silently
+                # overwrite a technician's earlier call. Change nothing.
+                db_conn.rollback()
+                return to_json({
+                    "status": "outcome_conflict",
+                    "reasoning_id": reasoning_id,
+                    "incoming_outcome": outcome,
+                    "existing_outcome": existing_outcome,
+                    "verified_at": checkpoint.get("verified_at"),
+                    "message": (
+                        f"Checkpoint {reasoning_id} already verified as "
+                        f"{existing_outcome!r}; refusing to overwrite with "
+                        f"{outcome!r}. Nothing changed."
+                    ),
+                })
+
+            if existing_outcome is None:
+                # First verification for this checkpoint: stamp it.
+                cur.execute(
+                    "UPDATE agent_reasoning "
+                    "SET verified_outcome = %s, verified_at = NOW() "
+                    "WHERE id = %s",
+                    (outcome, reasoning_id),
+                )
+                outcome_action = "stamped"
+            else:
+                # Identical outcome already stamped — do NOT re-stamp, but still
+                # propagate. This is the orphan-repair path.
+                outcome_action = "already_stamped_reprop"
+
+            # --- Mechanism 2: propagation state (per memory, per ref) ---
+            # A memory is linked via the platform-stamped pending_refs (v5) OR
+            # the model-authored source_refs (post-verification / legacy).
+            # JSON_CONTAINS over a NULL column yields NULL (excluded), so old
+            # rows without pending_refs are simply not matched.
             cur.execute("""
                 SELECT id, provenance,
-                       verified_confirmations, verified_contradictions
+                       verified_confirmations, verified_contradictions,
+                       source_refs, pending_refs, adjudicated_refs
                 FROM fleet_memory
                 WHERE status = 'active'
-                  AND JSON_CONTAINS(source_refs, %s)
-            """, (json.dumps(ref),))
-            touched = cur.fetchall()
+                  AND (JSON_CONTAINS(source_refs, %s)
+                       OR JSON_CONTAINS(pending_refs, %s))
+                FOR UPDATE
+            """, (json.dumps(ref), json.dumps(ref)))
+            candidates = cur.fetchall()
 
             updated = []
-            for row in touched:
+            skipped = []
+            escalation_flipped = False
+            for row in candidates:
+                adjudicated = _parse_adjudicated(row.get("adjudicated_refs"))
+                if _adjudicated_has_ref(adjudicated, ref):
+                    # Already counted against this memory — skip entirely.
+                    skipped.append({
+                        "memory_id": row["id"],
+                        "reason": "already_adjudicated",
+                    })
+                    continue
+
                 verified_confirmations = int(row["verified_confirmations"])
                 verified_contradictions = int(row["verified_contradictions"])
                 provenance = row["provenance"]
+                source_refs = _flatten_source_refs(row.get("source_refs"))
+                pending = _flatten_source_refs(row.get("pending_refs"))
+
+                # Append to the audit trail / idempotency record first.
+                adjudicated.append({
+                    "ref": ref, "outcome": outcome, "at": adjudicated_at,
+                })
+
                 if is_confirmation:
-                    verified_confirmations = verified_confirmations + 1
+                    # The ref has now earned evidence status: move it out of
+                    # pending_refs and into source_refs.
+                    pending = [r for r in pending if r != ref]
+                    if ref not in source_refs:
+                        source_refs = _flatten_source_refs(source_refs + [ref])
+                    verified_confirmations += 1
                     if provenance == "session":
                         provenance = "verified"
+                    # Flip the checkpoint out of escalated on the first positive
+                    # propagation (idempotent: only escalated -> confirmed).
+                    if cp_resolution == "escalated" and not escalation_flipped:
+                        cur.execute(
+                            "UPDATE agent_reasoning SET resolution = 'confirmed' "
+                            "WHERE id = %s",
+                            (reasoning_id,),
+                        )
+                        cp_resolution = "confirmed"
+                        escalation_flipped = True
                 else:
-                    verified_contradictions = verified_contradictions + 1
+                    # Negative outcome: drop from pending_refs but do NOT
+                    # promote to source_refs. The audit trail preserves the ref.
+                    pending = [r for r in pending if r != ref]
+                    verified_contradictions += 1
+
                 new_confidence = derive_confidence(
                     provenance, verified_confirmations, verified_contradictions
                 )
@@ -1033,10 +1437,14 @@ def verify_outcome(reasoning_id: int, outcome: str,
                     UPDATE fleet_memory
                     SET verified_confirmations = %s,
                         verified_contradictions = %s,
-                        provenance = %s, confidence = %s
+                        provenance = %s, confidence = %s,
+                        source_refs = %s, pending_refs = %s,
+                        adjudicated_refs = %s
                     WHERE id = %s
                 """, (verified_confirmations, verified_contradictions,
-                      provenance, new_confidence, row["id"]))
+                      provenance, new_confidence,
+                      json.dumps(source_refs), json.dumps(pending),
+                      json.dumps(adjudicated), row["id"]))
                 updated.append({
                     "memory_id": row["id"],
                     "confidence": new_confidence,
@@ -1051,12 +1459,104 @@ def verify_outcome(reasoning_id: int, outcome: str,
     finally:
         db_conn.close()
 
+    # Loud failure: status: ok is reserved for ACTUAL propagation.
+    if not updated:
+        warning = (
+            f"Outcome {outcome!r} was recorded on checkpoint {reasoning_id} "
+            f"but propagated to ZERO fleet memories"
+        )
+        if skipped:
+            warning += (
+                f" ({len(skipped)} memory(ies) already carried this ref in "
+                "adjudicated_refs — no double-count)."
+            )
+        else:
+            warning += (
+                " (no active memory carries this checkpoint ref in pending_refs "
+                "or source_refs). If this checkpoint predates v5 linkage, "
+                "re-run with --link-memory <memory_id>."
+            )
+        return to_json({
+            "status": "ok_no_propagation",
+            "reasoning_id": reasoning_id,
+            "outcome": outcome,
+            "outcome_action": outcome_action,
+            "notes": notes,
+            "warning": warning,
+            "touched_memories": [],
+            "skipped_memories": skipped,
+        })
+
     return to_json({
         "status": "ok",
         "reasoning_id": reasoning_id,
         "outcome": outcome,
+        "outcome_action": outcome_action,
         "notes": notes,
         "touched_memories": updated,
+        "skipped_memories": skipped,
+    })
+
+
+@_safe_handler
+def link_checkpoint_to_memory(reasoning_id: int, memory_id: int) -> str:
+    """MANUALLY stamp a checkpoint ref into a specific memory's pending_refs
+    (v5 legacy linkage — Task 3).
+
+    Used ONLY by `agent/verify_outcome.py --link-memory` to re-link the two
+    pre-v5 orphaned checkpoints whose refs were never stamped at write time
+    (fleet_memory has no session column, so the link is not derivable). The
+    link is ASSERTED by a human, not inferred — the CLI logs it as such.
+
+    Idempotent: if the ref is already present in pending_refs (or already
+    adjudicated into source_refs), nothing changes. Runs inside a FOR UPDATE
+    transaction, mirroring the write_fleet_memory pending_refs invariants (flat
+    scalar strings, deduped).
+    """
+    ref = f"agent_reasoning:{reasoning_id}"
+    db_conn = _get_pool().connection()
+    try:
+        db_conn.begin()
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, pending_refs, source_refs FROM fleet_memory "
+                "WHERE id = %s FOR UPDATE",
+                (memory_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                db_conn.rollback()
+                return to_json({
+                    "error": f"No fleet_memory row with id {memory_id}.",
+                    "tool": "link_checkpoint_to_memory",
+                    "retryable": False,
+                })
+            pending = _flatten_source_refs(row.get("pending_refs"))
+            source = _flatten_source_refs(row.get("source_refs"))
+            already_linked = ref in pending or ref in source
+            merged_pending = _flatten_source_refs(pending + [ref])
+            cur.execute(
+                "UPDATE fleet_memory SET pending_refs = %s WHERE id = %s",
+                (json.dumps(merged_pending), memory_id),
+            )
+        db_conn.commit()
+    except Exception:
+        db_conn.rollback()
+        raise
+    finally:
+        db_conn.close()
+    return to_json({
+        "status": "ok",
+        "manual_link": True,
+        "memory_id": memory_id,
+        "reasoning_id": reasoning_id,
+        "ref": ref,
+        "already_linked": already_linked,
+        "pending_refs": merged_pending,
+        "message": (
+            f"MANUAL LINK: stamped {ref} into fleet_memory {memory_id} "
+            "pending_refs (human-asserted, not derived)."
+        ),
     })
 
 
@@ -1879,11 +2379,24 @@ TOOL_HANDLERS = {
 }
 
 
-def handle_tool_call(tool_name: str, tool_input: dict) -> str:
-    """Dispatch a Claude tool call to the appropriate handler."""
+def handle_tool_call(tool_name: str, tool_input: dict,
+                     session_id: Optional[str] = None) -> str:
+    """Dispatch a Claude tool call to the appropriate handler.
+
+    ``session_id`` is the running investigation's session, injected by the
+    agent loop — NOT a model-supplied field. It is threaded into
+    write_fleet_memory so the platform can stamp the session's checkpoint ref
+    into pending_refs (v5); the model never sees or controls it, and it is not
+    part of tool_definitions.json.
+    """
     handler = TOOL_HANDLERS.get(tool_name)
     if not handler:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
+    # Platform-injected session context. Only write_fleet_memory consumes it,
+    # and only when the model did not (cannot) supply its own.
+    if (session_id and tool_name == "write_fleet_memory"
+            and "session_id" not in tool_input):
+        tool_input = {**tool_input, "session_id": session_id}
     try:
         return handler(**tool_input)
     except TypeError as e:
@@ -1956,6 +2469,75 @@ def _shortcut_eligible(match: dict) -> bool:
     return True
 
 
+def _gate_fail_reason(match: dict) -> Optional[str]:
+    """The FIRST gate clause that a match fails, or ``None`` if it is eligible.
+
+    Mirrors the clause order of ``_shortcut_eligible`` exactly so the routing
+    log can show WHY the nearest-miss candidate missed (Task 5). Distinct from
+    a boolean so "no similar memories" is separable from "similar memories,
+    all gated, and here is the binding constraint."
+    """
+    if match.get("superseded_by") is not None:
+        return "superseded"
+    try:
+        conf = float(match.get("confidence", 0))
+        sim = float(match.get("similarity", 0))
+        vc = int(match.get("verified_confirmations", 0))
+    except (TypeError, ValueError):
+        return "bad_types"
+    if conf < SHORTCUT_CONFIDENCE_MIN:
+        return f"confidence<{SHORTCUT_CONFIDENCE_MIN}"
+    if vc < SHORTCUT_CONFIRMATIONS_MIN:
+        return f"verified_confirmations<{SHORTCUT_CONFIRMATIONS_MIN}"
+    if sim < SHORTCUT_SIMILARITY_MIN:
+        return f"similarity<{SHORTCUT_SIMILARITY_MIN}"
+    return None
+
+
+def _stage_routing(fleet_matches: list) -> dict:
+    """Stage the fleet_memory candidates for routing observability (Task 5).
+
+    Pure function of the candidate list (unit-testable, no I/O). Returns staged
+    counts that make the failure modes distinguishable:
+
+        candidates   : how many candidates the (structurally-filtered) query
+                       returned. 0 => empty/thin fleet, NOT a gating problem.
+        similar      : candidates clearing the similarity floor. Separates
+                       "nothing similar" from "similar but otherwise gated."
+        eligible     : candidates passing the full structural gate.
+        top_candidate: the highest-DERIVED-confidence candidate (the one most
+                       likely to fire / the nearest miss), or None.
+        gate_fail_reason: the first failing clause of top_candidate (None if it
+                       passed) — the binding constraint for the nearest miss.
+
+    Eligibility is adjudicated HERE in Python (via _shortcut_eligible), not in
+    the candidate SQL: the candidate query keeps only the cheap structural
+    filters (status active, scope/category) so the gate is observable and its
+    thresholds live in one place.
+    """
+    def _conf(m):
+        try:
+            return float(m.get("confidence", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _sim(m):
+        try:
+            return float(m.get("similarity", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    top = max(fleet_matches, key=_conf) if fleet_matches else None
+    return {
+        "candidates": len(fleet_matches),
+        "similar": sum(1 for m in fleet_matches
+                       if _sim(m) >= SHORTCUT_SIMILARITY_MIN),
+        "eligible": sum(1 for m in fleet_matches if _shortcut_eligible(m)),
+        "top_candidate": top,
+        "gate_fail_reason": _gate_fail_reason(top) if top else None,
+    }
+
+
 def _classify_trigger(trigger: str, client, obs: Optional[AgentObserver] = None) -> str:
     """Classify trigger as 'lookup' or 'investigation'.
     Simple lookups (status checks, profile queries) can be answered
@@ -2008,6 +2590,25 @@ def _build_summary_prompt(checkpoint: dict, charger_id: str, trigger: str) -> st
     evidence = str(checkpoint.get("evidence_refs") or "[]")
     if len(evidence) > _SUMMARY_EVIDENCE_CHARS:
         evidence = evidence[:_SUMMARY_EVIDENCE_CHARS] + "…(truncated)"
+    # Confidence-calibrated hedging (Task 6): below 0.7 the report may only
+    # recommend inspection-to-confirm, never a definitive remediation order.
+    try:
+        conf_val = float(checkpoint.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf_val = 0.0
+    if conf_val < 0.7:
+        hedge = (
+            f"Confidence is LOW ({conf_val}). Do NOT issue a definitive "
+            "remediation order or state the cause as established. Frame the "
+            "diagnosis as a hypothesis and recommend an on-site inspection to "
+            "CONFIRM before any parts are ordered or replaced."
+        )
+    else:
+        hedge = (
+            f"Confidence is {conf_val}. A remediation recommendation is "
+            "warranted, but keep it proportionate to the evidence actually "
+            "present in the checkpoint."
+        )
     return (
         f"Write a final investigation report for charger {charger_id}.\n\n"
         f"Original alert: {trigger}\n\n"
@@ -2018,6 +2619,16 @@ def _build_summary_prompt(checkpoint: dict, charger_id: str, trigger: str) -> st
         f"  Resolution: {checkpoint['resolution']}\n"
         f"  Evidence: {evidence}\n"
         f"  Reasoning ID: {checkpoint['id']}\n\n"
+        "CONSTRAINTS (read before writing):\n"
+        "- Every factual claim MUST be traceable to the checkpoint fields "
+        "above or to tool results already in the investigation context. Do "
+        "NOT introduce details that are not present in those sources — no "
+        "dates, parts availability, staffing, SLAs, or prior remediation "
+        "attempts unless they appear in the checkpoint/tool data. If such a "
+        "detail is not available, STATE ITS ABSENCE (e.g. 'no maintenance "
+        "records are available in this investigation's data') rather than "
+        "inventing it.\n"
+        f"- {hedge}\n\n"
         "Write a 3-5 paragraph report covering: what was observed, "
         "the diagnosed cause, the recommended action, and any "
         "fleet-wide implications. Reference the evidence and the "
@@ -2064,6 +2675,14 @@ def _build_degraded_summary_prompt(checkpoint: Optional[dict], charger_id: str,
         "The findings below are PARTIAL and must not be reported as a "
         "confirmed diagnosis or a recommended fix.\n\n"
         f"{partial}\n\n"
+        "CONSTRAINTS (read before writing):\n"
+        "- Every factual claim MUST be traceable to the partial context above "
+        "or to tool results already in the investigation context. Do NOT "
+        "introduce details absent from those sources — no dates, parts "
+        "availability, staffing, SLAs, or prior remediation attempts. If such "
+        "a detail is unavailable, STATE ITS ABSENCE rather than inventing it.\n"
+        "- The investigation is incomplete, so recommend inspection / re-run / "
+        "human escalation only — never a definitive remediation order.\n\n"
         "Write a 2-3 paragraph report that: (1) states clearly that the "
         "investigation did not complete and why, (2) summarises what was "
         "observed so far without asserting a root cause, and (3) recommends "
@@ -2074,7 +2693,9 @@ def _build_degraded_summary_prompt(checkpoint: Optional[dict], charger_id: str,
 
 def _run_agent_loop(client, loop_model: str, cached_system: list,
                     tools: list, messages: list, max_tool_rounds: int,
-                    obs: AgentObserver) -> tuple[dict, bool, Optional[str]]:
+                    obs: AgentObserver,
+                    session_id: Optional[str] = None
+                    ) -> tuple[dict, bool, Optional[str]]:
     """Drive the Claude tool loop, branching EXHAUSTIVELY on stop_reason.
 
     Mutates ``messages`` in place. Returns (tool_call_counts, degraded,
@@ -2182,7 +2803,8 @@ def _run_agent_loop(client, loop_model: str, cached_system: list,
                 obs.tool_call_start(tc.name, tc.input)
                 tool_call_counts[tc.name] = tool_call_counts.get(tc.name, 0) + 1
 
-                result = handle_tool_call(tc.name, tc.input)
+                result = handle_tool_call(tc.name, tc.input,
+                                          session_id=session_id)
 
                 # Extract result size for observability
                 try:
@@ -2321,33 +2943,42 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
                 or _conf > float(best_shortcut_match.get("confidence", 0))):
             best_shortcut_match = m
 
+    # Stage the candidates for observability. Eligibility is adjudicated in
+    # Python (above / _stage_routing), NOT prefiltered in the candidate SQL —
+    # so the log can distinguish an empty fleet (candidates=0) from a populated
+    # one where every candidate was gated (candidates>0, eligible=0), and the
+    # nearest miss shows the binding constraint.
+    staged = _stage_routing(fleet_matches)
+
     # Print routing inputs directly to stderr. log.info goes to a
     # logger that has no handler attached when dispatch.py runs and
     # gets silently dropped at default WARNING level, so we bypass
     # Python logging here for guaranteed visibility. Tagged [ROUTING]
-    # so it's grep-friendly.
+    # so it's grep-friendly. This stderr line is captured into the dispatch
+    # log — it is the durable record of the staged counts.
     import sys as _sys_routing
+    _top = staged["top_candidate"]
     _top_str = (
-        f"id={top_match.get('id')}"
-        f"/conf={top_match.get('confidence')}"
-        f"/sim={top_match.get('similarity')}"
-        if top_match else "None"
-    )
-    _eligible_str = (
-        f"id={best_shortcut_match.get('id')}"
-        f"/conf={best_shortcut_match.get('confidence')}"
-        f"/vconfirm={best_shortcut_match.get('verified_confirmations')}"
-        f"/vcontra={best_shortcut_match.get('verified_contradictions')}"
-        f"/corrob={best_shortcut_match.get('corroborations')}"
-        f"/prov={best_shortcut_match.get('provenance')}"
-        f"/sim={best_shortcut_match.get('similarity')}"
-        if best_shortcut_match else "none"
+        f"id={_top.get('id')}"
+        f"/conf={_top.get('confidence')}"
+        f"/vconf={_top.get('verified_confirmations')}"
+        f"/sim={_top.get('similarity')}"
+        if _top else "none"
     )
     _sys_routing.stderr.write(
-        f"[ROUTING] session={session_id} matches={len(fleet_matches)} "
-        f"top_match={_top_str} eligible={_eligible_str}\n"
+        f"[ROUTING] session={session_id} "
+        f"candidates={staged['candidates']} "
+        f"similar={staged['similar']} "
+        f"eligible={staged['eligible']} "
+        f"top_candidate={_top_str} "
+        f"gate_fail_reason={staged['gate_fail_reason']}\n"
     )
     _sys_routing.stderr.flush()
+    # Persist staged counts on the observer alongside the routing decision
+    # (record_routing below records the decision itself). observability.py is
+    # out of scope for this change, so the counts ride as an observer attribute
+    # rather than a new record_routing parameter.
+    obs.routing_staged = staged
 
     if best_shortcut_match is not None:
         loop_model = HAIKU_MODEL
@@ -2397,7 +3028,7 @@ Tokens used for context: {ctx['tokens_used']}/{TOKEN_BUDGET_DEFAULT}
 
     tool_call_counts, degraded, degraded_reason = _run_agent_loop(
         client, loop_model, cached_system, tools_config["tools"],
-        messages, max_tool_rounds, obs,
+        messages, max_tool_rounds, obs, session_id=session_id,
     )
 
     # Force a clean final summary via Haiku, but DO NOT replay the full

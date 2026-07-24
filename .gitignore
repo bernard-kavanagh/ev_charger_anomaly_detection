@@ -37,3 +37,5 @@ Thumbs.db
 run.log
 .claude/
 run.log
+dispatch-*.log
+.venv/
